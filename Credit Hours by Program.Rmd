@@ -1,0 +1,509 @@
+---
+title: "Student Credit Hour By Program"
+author: "Tony Daza"
+date: "2026-01-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+**JUMP TO ALL IN ONE**
+
+# Credit Hour by program for different student groups 
+To calculate and predict income from tuition the office needs credit hours per program (subject). In addition, the students should be broken up by undergrad, graduate, and flex. With those further divided by resident status. 
+
+Because we need Flex data this should be pulled from rds as well as the need to have the most up to date data (CDR is a year behind). 
+
+CDR - V_Student_Analytical has the resident information we want (But would not have flex students)
+
+RDS - REC_STUDENT_TERM_V & REC_STUDENT_TERM_FACT_V & REC_CLASS_DIM_V
+
+REC_STUDENT_TERM_V = This has student information such as career(Grad vs UG), CTerm_TERM (4-digit code), Academic Year, load code
+
+REC_STUDENT_TERM_FACT_V = The individual credit hours 
+
+REC_CLASS_DIM_V = rows per class, CLASS_SUBJECT_LDESC (Subject is the grain we want for the final dataset) & course ID
+- (Or do they want Class_ACAD_ORG as the descriptor for subject/program?)
+
+REC_CRSE_CATALOG_DIM_V = CRSE_COURSE_TITLE_LONG (This might work for Flex)
+
+Residency in RDS:
+CC_RESIDENCY_DIM_V = Can match on EMPLID, RES_RESIDENCY & RES_RESIDENCY_LDESC
+
+
+## Student Terms Key 
+
+
+```{r}
+
+# res_status <- dbGetQuery(
+#   con_rds,
+#   "
+#   SELECT 
+#       RES_EMPLID,
+#       RES_ACAD_CAREER_SDESC,
+#       RES_EFFECTIVE_TERM,
+#       RES_RESIDENCY,
+#       RES_RESIDENCY_LDESC,
+#       RES_RESIDENCY_DT
+#   FROM PKS_RDS_USR.CC_RESIDENCY_DIM_V
+#       WHERE RES_INSTITUTION = 'UWPKS'
+#       AND RES_EFFECTIVE_TERM IN('1257', '1261', '1263', '1265', '6506', '6507', '6508', '6509', '6510', '6511', '6512', '6601')
+#   "
+# )
+
+
+# Terms: 
+## Summer 2025-2026 = 1267
+## Spring 2025-2026 = 1265
+## Winter 2025-2026 = 1263
+## Fall 2025-2026 = 1261
+## Summer 2025-2026 = 1257
+
+
+
+# Flex terms??
+## March - May 2026 = 6603
+## Feb - April 2026 = 6602
+## Jan - March 2026 = 6601
+## Dec - Feb 2026 = 6512
+## Nov - Jan 2026 = 6511
+## Oct - Dec 2025 = 6510
+## Sept - Nov 2025 = 6509
+## Aug - Oct 2025 = 6508
+## Jul - Sept 2025 = 6507
+## Jun - Aug 2025 = 6506
+```
+
+
+## List of courses for the selected terms
+
+Lacks sufficient detail but it is a list of the courses but will be combined with enrollment data for credit hours using class_sid
+
+```{r}
+
+classes_25 <- dbGetQuery(
+  con_rds,
+  "
+  SELECT
+      A1.CLASS_SID,
+      A1.CLASS_TERM_CD,
+      A1.CLASS_TERM_SDESC,
+      A1.CLASS_TERM_ACAD_YEAR,
+      A1.CLASS_ACAD_GROUP_LDESC,
+      A1.CLASS_ACAD_ORG_LDESC,
+      A1.CLASS_SUBJECT_LDESC
+  FROM PKS_RDS_USR.REC_CLASS_DIM_V A1
+  WHERE A1.CLASS_INSTITUTION_CD = 'UWPKS'
+      AND A1.CLASS_TERM_CD IN('1257', '1261', '1263', '1265', '6506', '6507', '6508', '6509', '6510', '6511', '6512', '6601')
+  "
+)
+
+
+
+
+```
+
+## List of courses with students for those term
+
+REC_CLASS_DIM_V link with REC Enrollment using Class_sid
+
+This results in a list of student enrollment data by class. We will use credits (units) as credit hours and use subject of class to get credit hours by subject. 
+
+This currently lacks sufficient student information though. 
+
+
+```{r}
+
+stud_enroll_classes_25 <- dbGetQuery(
+  con_rds,
+  "
+  SELECT
+      e.CTERM_SID,
+      e.CLASS_SID,
+      e.ENRL_EMPLID,
+      e.ENRL_ACAD_CAREER,
+      e.ENRL_UNITS_TAKEN,
+      e.ENRL_UNITS_BILLING,
+      e.ENRL_EARNED_CREDIT
+      c.CLASS_TERM_CD,
+      c.CLASS_TERM_SDESC,
+      c.CLASS_TERM_ACAD_YEAR,
+      c.CLASS_ACAD_GROUP_LDESC,
+      c.CLASS_ACAD_ORG_LDESC,
+      c.CLASS_SUBJECT_LDESC
+  FROM PKS_RDS_USR.REC_ENROLLMENT_FACT_V e 
+  JOIN PKS_RDS_USR.REC_CLASS_DIM_V c
+    ON c.CLASS_SID = e.CLASS_SID
+  WHERE c.CLASS_INSTITUTION_CD = 'UWPKS'
+      AND c.CLASS_TERM_CD IN('1257', '1261', '1263', '1265', '6506', '6507', '6508', '6509', '6510', '6511', '6512', '6601')
+  "
+)
+
+
+
+#############
+
+unique_values(stud_enroll_classes_25)
+
+```
+
+
+### List of CTERM IDs 
+This prevents pulling the full student-term table and just gets the ones with class enrollment data 
+
+```{r}
+
+
+cterm_sids <- stud_enroll_classes_25 %>%
+  distinct(CTERM_SID) %>%
+  pull(CTERM_SID)
+
+cterm_sid_sql <- paste(sprintf("'%s'", cterm_sids), collapse = ",")
+
+
+
+```
+
+
+## Pull student term data 
+
+Just pulling the student term data from student enrollment IDs for 2025 terms
+
+```{r}
+
+stud_term_25 <- dbGetQuery(
+  con_rds,
+  sprintf(
+    "
+    SELECT
+        CTERM_SID,
+        CTERM_EMPLID,
+        CTERM_CATEGORY_SDESC,
+        CTERM_ACAD_YEAR,
+        CTERM_TERM_CD,
+        CTERM_TERM_SDESC,
+        CTERM_ACAD_LOAD_SDESC,
+        CTERM_ACAD_LEVEL_BOT_LDESC
+    FROM PKS_RDS_USR.REC_STUDENT_TERM_DIM_V
+    WHERE CTERM_INSTITUTION_CODE = 'UWPKS'
+      AND CTERM_SID IN (%s)
+    ",
+    cterm_sid_sql
+  )
+)
+
+
+
+```
+
+
+## Pull Student Residency data 
+
+This should pull just the student residency data from students that enrolled in classes in 2025, but we have to use their most recent residency status using effective term. This is because some students have residency from before the enrolled term that gets lost if we just pull on enrolled term. 
+
+### List of enrolled students
+
+```{r}
+
+keys <- stud_enroll_classes_25 %>%
+  distinct(ENRL_EMPLID, CLASS_TERM_CD) %>%
+  mutate(
+    ENRL_EMPLID = as.character(ENRL_EMPLID),
+    CLASS_TERM_CD = as.character(CLASS_TERM_CD)
+  )
+
+
+```
+
+
+### Residency plus key to extract student data 
+
+This uses the most recent residency term data to asign the student a residency status. 
+
+```{r}
+
+
+key_rows_sql <- paste0(
+  "SELECT '", keys$ENRL_EMPLID, "' AS EMPLID, '", keys$CLASS_TERM_CD, "' AS TERM_CD FROM dual",
+  collapse = " UNION ALL "
+)
+
+res_asof_25 <- dbGetQuery(
+  con_rds,
+  sprintf(
+    "
+    WITH keylist AS (
+      %s
+    ),
+    res_ranked AS (
+      SELECT
+        k.EMPLID,
+        k.TERM_CD,
+        r.RES_ACAD_CAREER_SDESC,
+        r.RES_EFFECTIVE_TERM,
+        r.RES_RESIDENCY,
+        r.RES_RESIDENCY_LDESC,
+        r.RES_RESIDENCY_DT,
+        ROW_NUMBER() OVER (
+          PARTITION BY k.EMPLID, k.TERM_CD
+          ORDER BY r.RES_EFFECTIVE_TERM DESC, r.RES_RESIDENCY_DT DESC
+        ) AS rn
+      FROM keylist k
+      LEFT JOIN PKS_RDS_USR.CC_RESIDENCY_DIM_V r
+        ON r.RES_EMPLID = k.EMPLID
+       AND r.RES_INSTITUTION = 'UWPKS'
+       AND r.RES_EFFECTIVE_TERM <= k.TERM_CD
+    )
+    SELECT *
+    FROM res_ranked
+    WHERE rn = 1
+    ",
+    key_rows_sql
+  )
+)
+
+
+
+
+```
+
+
+### Combining student data with Residency data
+
+
+REC_STUDENT_TERM_DIM_V (Student data on terms) with Residency data
+
+CTERM_EMPLID = RES_EMPLID
+
+We will pull residency status as well as load descriptor (CTERM_ACAD_LOAD_SDESC) and academic level (CTERM_ACAD_LEVEL_BOT_LDESC)
+
+Might as well include term information as well. (CTERM_CATEGORY_SDESC) and (CTERM_ACAD_YEAR) and (CTERM_TERM_CD) as well as (CTERM_TERM_SDESC)
+
+Of course I still need to filter on (CTERM_INSTITUTION_CODE = UWPKS)
+
+This can be joined to student residency data through CTERM_EMPLID
+
+It can be joined to the class info through ENRL_EMPLID = CTERM_EMPLID
+
+
+```{r}
+
+stud_enroll_full_25 <- stud_enroll_classes_25 %>%
+  left_join(stud_term_25, by = "CTERM_SID") %>%
+  left_join(
+    res_asof_25,
+    by = c("ENRL_EMPLID" = "EMPLID", "CLASS_TERM_CD" = "TERM_CD")
+  )
+
+
+
+```
+
+
+
+# Combine lists to get a list of students with class info
+
+Link stud_enroll_classes_25 with student data using ENRL_EMPLID = CTERM_EMPLID as well as CTERM_SID = CTERM_SID
+
+
+Include term to differentiate classes by term
+
+```{r}
+
+
+
+
+
+stud_enroll_full_25 <- stud_enroll_classes_25 %>%
+  left_join(
+    stud_demo_25 %>%
+      select(
+        CTERM_SID,
+        CTERM_EMPLID,
+        CTERM_TERM_CD,
+        CTERM_CATEGORY_SDESC,
+        CTERM_ACAD_YEAR,
+        CTERM_TERM_SDESC,
+        CTERM_ACAD_LOAD_SDESC,
+        CTERM_ACAD_LEVEL_BOT_LDESC,
+        RES_ACAD_CAREER_SDESC,
+        RES_RESIDENCY,
+        RES_RESIDENCY_LDESC
+      ),
+    by = "CTERM_SID"  
+  )
+
+
+
+
+```
+
+
+This should subsequently show a class row list of students enrolled per term with subject information.
+
+That list will likely need to be pivoted by subject with indicator for student career and resident status.
+
+
+
+# All in one
+
+
+This is likely the most accurate. The reason being, prior to this the residency data was being pulled in first by effective date, but that was not the same as enrollment date, leading to missing data from residency. 
+
+Downstream this led to missing data in the student demographics which was then passed down to the final dataset. 
+
+To remedy this, the pull had to be done in RDS by matching residency status to the class enrollment data. Each student's enrollment was matched to their most recent residency term (Ideally equal, but if that was not present than the most recent effective residency date).
+
+Subsequently the enrollment class data was joined to the student term data and the residency data. That resulted in a more complete dataset. 
+
+This new rule means I am pulling the residency status that would have been in effect for that term of enrollment, or the most recent residency status on file for that student as of the term selected.
+
+*Note* I should include student classification. (In CDR S = Over 60 i.e. they don't pay). Need to find the variable in RDS. Maybe REC_STDNT_GROUPS_DIM_V or REC_STDNT_GROUPS_DIM_ALL_V
+
+```{r}
+
+stud_enroll_full_25 <- dbGetQuery(
+  con_rds,
+  "
+  WITH enroll AS (
+    SELECT
+      e.CTERM_SID,
+      e.CLASS_SID,
+      e.ENRL_EMPLID,
+      e.ENRL_ACAD_CAREER,
+      e.ENRL_UNITS_TAKEN,
+      e.ENRL_UNITS_BILLING,
+      e.ENRL_EARNED_CREDIT,
+      e.ENRL_STATUS_SDESC,
+      c.CLASS_TERM_CD,
+      c.CLASS_TERM_SDESC,
+      c.CLASS_TERM_ACAD_YEAR,
+      c.CLASS_ACAD_GROUP_LDESC,
+      c.CLASS_ACAD_ORG_LDESC,
+      c.CLASS_SUBJECT_LDESC
+    FROM PKS_RDS_USR.REC_ENROLLMENT_FACT_V e
+    JOIN PKS_RDS_USR.REC_CLASS_DIM_V c
+      ON c.CLASS_SID = e.CLASS_SID
+    WHERE c.CLASS_INSTITUTION_CD = 'UWPKS'
+      AND c.CLASS_TERM_CD IN('1257','1261','1263','1265',
+                             '6506','6507','6508','6509',
+                             '6510','6511','6512','6601')
+  ),
+  stud_term AS (
+    SELECT
+      st.CTERM_SID,
+      st.CTERM_EMPLID,
+      st.CTERM_CATEGORY_SDESC,
+      st.CTERM_ACAD_YEAR,
+      st.CTERM_TERM_CD,
+      st.CTERM_TERM_SDESC,
+      st.CTERM_ACAD_LOAD_SDESC,
+      st.CTERM_ACAD_LEVEL_BOT_LDESC,
+      st.CTERM_FA_LOAD_CODE
+    FROM PKS_RDS_USR.REC_STUDENT_TERM_DIM_V st
+    WHERE st.CTERM_INSTITUTION_CODE = 'UWPKS'
+      AND st.CTERM_TERM_CD IN('1257','1261','1263','1265',
+                              '6506','6507','6508','6509',
+                              '6510','6511','6512','6601')
+  ),
+  res_ranked AS (
+    SELECT
+      en.ENRL_EMPLID,
+      en.CLASS_TERM_CD,
+      r.RES_ACAD_CAREER_SDESC,
+      r.RES_EFFECTIVE_TERM,
+      r.RES_RESIDENCY,
+      r.RES_RESIDENCY_LDESC,
+      r.RES_TUITION_RES_SDESC,
+      r.RES_TUITION_RES_LDESC,
+      r.RES_RESIDENCY_DT,
+      ROW_NUMBER() OVER (
+        PARTITION BY en.ENRL_EMPLID, en.CLASS_TERM_CD
+        ORDER BY r.RES_EFFECTIVE_TERM DESC, r.RES_RESIDENCY_DT DESC
+      ) AS rn
+    FROM enroll en
+    LEFT JOIN PKS_RDS_USR.CC_RESIDENCY_DIM_V r
+      ON r.RES_EMPLID = en.ENRL_EMPLID
+     AND r.RES_INSTITUTION = 'UWPKS'
+     AND r.RES_EFFECTIVE_TERM <= en.CLASS_TERM_CD
+  )
+  SELECT
+    en.*,
+    st.CTERM_CATEGORY_SDESC,
+    st.CTERM_ACAD_LOAD_SDESC,
+    st.CTERM_ACAD_LEVEL_BOT_LDESC,
+    st.CTERM_FA_LOAD_CODE,
+    rr.RES_EFFECTIVE_TERM,
+    rr.RES_RESIDENCY,
+    rr.RES_RESIDENCY_LDESC,
+    rr.RES_TUITION_RES_SDESC,
+    rr.RES_TUITION_RES_LDESC,
+    rr.RES_RESIDENCY_DT
+  FROM enroll en
+  LEFT JOIN stud_term st
+    ON st.CTERM_SID = en.CTERM_SID
+   AND st.CTERM_EMPLID = en.ENRL_EMPLID
+   AND st.CTERM_TERM_CD = en.CLASS_TERM_CD
+  LEFT JOIN res_ranked rr
+    ON rr.ENRL_EMPLID = en.ENRL_EMPLID
+   AND rr.CLASS_TERM_CD = en.CLASS_TERM_CD
+   AND rr.rn = 1
+  "
+)
+
+
+
+
+```
+
+
+## Missingness 
+
+None, must have pulled all the student residency data.
+
+```{r}
+
+
+# Spot check missingness
+stud_enroll_full_25 %>%
+  summarise(
+    n_rows = n(),
+    missing_student_term = sum(is.na(CTERM_CATEGORY_SDESC)),
+    missing_residency = sum(is.na(RES_RESIDENCY))
+  )
+
+```
+
+# Count 
+
+
+Let's see if we group by term, the counts of student credit hours. 
+
+```{r}
+
+
+unique_values(stud_enroll_full_25, RES_TUITION_RES_LDESC)
+
+unique_values(stud_enroll_full_25, CTERM_ACAD_LEVEL_BOT_LDESC)
+
+unique_values(stud_enroll_full_25, CTERM_FA_LOAD_CODE)
+
+
+
+stud_enroll_full_25 %>%
+  group_by(CLASS_TERM_SDESC, CLASS_SUBJECT_LDESC, ENRL_ACAD_CAREER, RES_RESIDENCY) %>%
+  count(ENRL_UNITS_TAKEN, ENRL_UNITS_BILLING)
+
+
+# Enroll units taken and units billing are identical in this dataset. No differences
+
+
+
+```
+
+
