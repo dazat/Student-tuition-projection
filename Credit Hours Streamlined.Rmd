@@ -8,10 +8,10 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 library(DBI)
-library(odbc)
-library(keyring)
 library(dplyr)
 library(stringr)
+library(odbc)
+library(keyring)
 library(tidyr)
 library(ggplot2)
 library(knitr)
@@ -176,7 +176,7 @@ stud_enroll_full <- dbGetQuery(
         st.CTERM_TERM_SDESC,
         st.CTERM_ACAD_LOAD_SDESC,
         st.CTERM_ACAD_LEVEL_BOT_LDESC,
-        st.CTERM_FA_LOAD_CODE
+        st.CTERM_FA_LOAD_CODE         -- F = Full load, N = No load (audit), L = less than full time, T = three quarters, H = half time
       FROM PKS_RDS_USR.REC_STUDENT_TERM_DIM_V st
       WHERE st.CTERM_INSTITUTION_CODE = 'UWPKS'
         AND st.CTERM_TERM_CD IN (%s)
@@ -215,8 +215,8 @@ stud_enroll_full <- dbGetQuery(
       rr.RES_TUITION_RES_LDESC
     FROM enroll en
     LEFT JOIN stud_term st
-      ON  st.CTERM_SID     = en.CTERM_SID
-      AND st.CTERM_EMPLID  = en.ENRL_EMPLID
+      ON  st.CTERM_SID    = en.CTERM_SID
+      AND st.CTERM_EMPLID = en.ENRL_EMPLID
       AND st.CTERM_TERM_CD = en.CLASS_TERM_CD
     LEFT JOIN res_ranked rr
       ON  rr.ENRL_EMPLID   = en.ENRL_EMPLID
