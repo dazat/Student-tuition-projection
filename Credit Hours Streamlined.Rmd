@@ -1,0 +1,432 @@
+---
+title: "Credit Hours by Program — Streamlined"
+author: "Tony Daza"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(DBI)
+library(dplyr)
+library(stringr)
+library(odbc)
+library(keyring)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+```
+
+# Overview
+
+This document calculates credit hours by program (subject) for tuition revenue
+projections. Students are grouped into the following categories:
+
+- **UGRD** — Traditional undergraduate, resident or non-resident
+- **GRAD** — Graduate students, resident or non-resident (graduate-level courses only)
+- **UFLEX** — University Flex students (identified by career code or term code prefix)
+- **WI 60+ Audit** — Wisconsin residents aged 60+ who are auditing (no-load) — excluded from billed credit hours but tracked separately
+
+Residency categories use `RES_TUITION_RES_LDESC`. Students previously coded
+under the Midwest Student Exchange (which UW-Parkside no longer participates in)
+are recoded to **Midwest Tuition Non-Resident**.
+
+---
+
+# Term Reference
+
+```{r term-reference}
+# ── Traditional terms (CLASS_TERM_CD begins with 1) ──────────────────────────
+# 1257 = Summer 2024–2025
+# 1261 = Fall   2025–2026
+# 1263 = Winter 2025–2026
+# 1265 = Spring 2025–2026
+# 1267 = Summer 2025–2026
+
+# ── UFlex terms (CLASS_TERM_CD begins with 5 or 6) ───────────────────────────
+# 6506 = Jun–Aug 2025
+# 6507 = Jul–Sep 2025
+# 6508 = Aug–Oct 2025
+# 6509 = Sep–Nov 2025
+# 6510 = Oct–Dec 2025
+# 6511 = Nov–Jan 2026
+# 6512 = Dec–Feb 2026
+# 6601 = Jan–Mar 2026
+# 6602 = Feb–Apr 2026
+# 6603 = Mar–May 2026
+
+TRADITIONAL_TERMS <- c('1257','1261','1263','1265','1267')
+UFLEX_TERMS       <- c('6506','6507','6508','6509','6510',
+                        '6511','6512','6601','6602','6603')
+ALL_TERMS         <- c(TRADITIONAL_TERMS, UFLEX_TERMS)
+```
+
+
+--- 
+
+# Connect RDS 
+
+```{r connect}
+
+con_rds <- dbConnect(
+  odbc::odbc(),
+  dsn     = "Oracle RDS",
+  uid     = "DAZA",
+  pwd     = keyring::key_get("oracle_rds", "DAZA"),
+  timeout = 10
+)
+
+
+```
+
+
+
+---
+
+# Step 1 — Pull Enrollment, Class, Student-Term, and Residency Data
+
+One consolidated query joins:
+
+- `REC_ENROLLMENT_FACT_V` — one row per student per class
+- `REC_CLASS_DIM_V` — class metadata (subject, academic group, term)
+- `REC_STUDENT_TERM_DIM_V` — student term record (career, load code, academic level)
+- `CC_RESIDENCY_DIM_V` — most-recent residency effective on or before the enrollment term
+
+`CTERM_FA_LOAD_CODE` values: **F** = Full load, **N** = No load (audit / non-credit), **T** = 3/4 enrollment, **H** = Half time enrollment, **L** = less than half time.
+
+- `V_STUCRS` from CDR -> UWSA - student rows with YEAR = 202526 (example), TERM = (1 = Fall, 2 = Spring, S = Summer), UNIT = G, CUM_GPA, CLASSIF where A,B,C,D are regular undergrads (freshmen, sophomore, junior, senior) and S = senior over 65. Classif J and O are undergraduate special cases and E is a master's student. This dataset also has RES_STATUS where **R** = Resident, **A** = resident alumni discount, **B** non-resident alumni discount, **V** = non-resident veteran, **L** nonresident but Midwest tuition, **M** = nonresident but Michigan reciprocity, **S** non-resident but Minnesota reciprocity, **W** non-resident but Wisconsin return discount, **E** = nonresident but midwest exchange program, **N** = nonresident general. Importantly, this CDR data can be joined with RDS data where EMPLID variables = CAMPUS_STUDENT_ID.
+
+```{r pull-enrollment}
+
+all_terms_sql <- paste(sprintf("'%s'", ALL_TERMS), collapse = ", ")
+
+stud_enroll_full <- dbGetQuery(
+  con_rds,
+  sprintf(
+    "
+    WITH enroll AS (
+      SELECT
+        e.CTERM_SID,
+        e.CLASS_SID,
+        e.ENRL_EMPLID,
+        e.ENRL_ACAD_CAREER,
+        e.ENRL_UNITS_TAKEN,
+        e.ENRL_UNITS_BILLING,
+        e.ENRL_STATUS_SDESC,
+        c.CLASS_TERM_CD,
+        c.CLASS_TERM_SDESC,
+        c.CLASS_TERM_ACAD_YEAR,
+        c.CLASS_ACAD_GROUP_LDESC,   -- e.g. 'Undergraduate', 'Graduate'
+        c.CLASS_ACAD_ORG_LDESC,
+        c.CLASS_SUBJECT_LDESC
+      FROM PKS_RDS_USR.REC_ENROLLMENT_FACT_V e
+      JOIN PKS_RDS_USR.REC_CLASS_DIM_V c
+        ON c.CLASS_SID = e.CLASS_SID
+      WHERE c.CLASS_INSTITUTION_CD = 'UWPKS'
+        AND c.CLASS_TERM_CD IN (%s)
+    ),
+    stud_term AS (
+      SELECT
+        st.CTERM_SID,
+        st.CTERM_EMPLID,
+        st.CTERM_TERM_CD,
+        st.CTERM_CATEGORY_SDESC,
+        st.CTERM_ACAD_YEAR,
+        st.CTERM_TERM_SDESC,
+        st.CTERM_ACAD_LOAD_SDESC,
+        st.CTERM_ACAD_LEVEL_BOT_LDESC,
+        st.CTERM_FA_LOAD_CODE         -- F = Full load, N = No load (audit), L = less than full time, T = three quarters, H = half time
+      FROM PKS_RDS_USR.REC_STUDENT_TERM_DIM_V st
+      WHERE st.CTERM_INSTITUTION_CODE = 'UWPKS'
+        AND st.CTERM_TERM_CD IN (%s)
+    ),
+    res_ranked AS (
+      SELECT
+        en.ENRL_EMPLID,
+        en.CLASS_TERM_CD,
+        r.RES_ACAD_CAREER_SDESC,
+        r.RES_EFFECTIVE_TERM,
+        r.RES_RESIDENCY,
+        r.RES_RESIDENCY_LDESC,
+        r.RES_TUITION_RES_SDESC,
+        r.RES_TUITION_RES_LDESC,
+        r.RES_RESIDENCY_DT,
+        ROW_NUMBER() OVER (
+          PARTITION BY en.ENRL_EMPLID, en.CLASS_TERM_CD
+          ORDER BY r.RES_EFFECTIVE_TERM DESC, r.RES_RESIDENCY_DT DESC
+        ) AS rn
+      FROM enroll en
+      LEFT JOIN PKS_RDS_USR.CC_RESIDENCY_DIM_V r
+        ON  r.RES_EMPLID      = en.ENRL_EMPLID
+        AND r.RES_INSTITUTION = 'UWPKS'
+        AND r.RES_EFFECTIVE_TERM <= en.CLASS_TERM_CD
+    )
+    SELECT
+      en.*,
+      st.CTERM_CATEGORY_SDESC,
+      st.CTERM_ACAD_LOAD_SDESC,
+      st.CTERM_ACAD_LEVEL_BOT_LDESC,
+      st.CTERM_FA_LOAD_CODE,
+      rr.RES_EFFECTIVE_TERM,
+      rr.RES_RESIDENCY,
+      rr.RES_RESIDENCY_LDESC,
+      rr.RES_TUITION_RES_SDESC,
+      rr.RES_TUITION_RES_LDESC
+    FROM enroll en
+    LEFT JOIN stud_term st
+      ON  st.CTERM_SID    = en.CTERM_SID
+      AND st.CTERM_EMPLID = en.ENRL_EMPLID
+      AND st.CTERM_TERM_CD = en.CLASS_TERM_CD
+    LEFT JOIN res_ranked rr
+      ON  rr.ENRL_EMPLID   = en.ENRL_EMPLID
+      AND rr.CLASS_TERM_CD = en.CLASS_TERM_CD
+      AND rr.rn = 1
+    ",
+    all_terms_sql,
+    all_terms_sql
+  )
+)
+
+```
+
+---
+
+# Step 2 — Pull Student Groups (Wisconsin 60+ Identification)
+
+Student group codes identify special populations. We pull all groups for enrolled
+students and look for the Senior Citizen / Over-60 code.
+Review the values of `STDNT_GROUP` in the output to confirm the exact code used
+at UW-Parkside (commonly `'SR60'` or similar; update `WI60_GROUPS` below as needed).
+
+
+**Student groups really come from Resident Status**
+
+```{r pull-student-groups}
+enrolled_emplids_sql <- stud_enroll_full %>%
+  distinct(ENRL_EMPLID) %>%
+  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
+  summarise(ids = paste(sprintf("'%s'", ENRL_EMPLID), collapse = ", ")) %>%
+  pull(ids)
+
+stud_groups <- dbGetQuery(
+  con_rds,
+  sprintf(
+    "
+    SELECT
+      sg.STDNT_GROUP_EMPLID,
+      sg.STDNT_GROUP,
+      sg.STDNT_GROUP_LDESC
+    FROM PKS_RDS_USR.REC_STDNT_GROUPS_DIM_V sg
+    WHERE sg.STDNT_GROUP_INSTITUTION = 'UWPKS'
+      AND sg.STDNT_GROUP_EMPLID IN (%s)
+    ",
+    enrolled_emplids_sql
+  )
+)
+
+# Review unique group codes to confirm the correct 60+ code
+stud_groups %>%
+  distinct(STDNT_GROUP, STDNT_GROUP_LDESC) %>%
+  arrange(STDNT_GROUP)
+```
+
+```{r define-wi60-group}
+# ── UPDATE THIS VECTOR after reviewing the group codes above ─────────────────
+# Common values: 'SR60', 'S', 'OA60' — verify against your stud_groups output
+WI60_GROUPS <- c('SR60')   # <-- confirm / update as needed
+
+wi60_emplids <- stud_groups %>%
+  filter(STDNT_GROUP %in% WI60_GROUPS) %>%
+  distinct(STDNT_GROUP_EMPLID) %>%
+  pull(STDNT_GROUP_EMPLID)
+```
+
+
+```{r close_connection}
+# Close the connection once all data is retrieved.
+dbDisconnect(con_rds)
+```
+
+
+---
+
+# Step 3 — Classify Students and Recode Residency
+
+## 3a — Apply Student Career Groups
+
+Classification priority:
+
+1. **WI 60+ Audit** — student is in the 60+ group, has Wisconsin residency, and
+   enrolled as no-load (`CTERM_FA_LOAD_CODE == 'N'`)
+2. **UFLEX** — `ENRL_ACAD_CAREER == 'UFLEX'` OR term code does NOT start with `'1'`
+3. **GRAD** — `ENRL_ACAD_CAREER == 'GRAD'` (and traditional term)
+4. **UGRD** — `ENRL_ACAD_CAREER == 'UGRD'` (and traditional term)
+5. **Other** — anything else (review and reclassify as needed)
+
+```{r classify-students}
+stud_classified <- stud_enroll_full %>%
+  mutate(
+    # Wisconsin resident flag (adjust RES_RESIDENCY code to match your data)
+    is_wi_resident = RES_RESIDENCY %in% c('RES', 'WIS', 'WIRES'),
+
+    # No-load (audit) flag
+    is_no_load = CTERM_FA_LOAD_CODE == 'N',
+
+    # UFlex flag: career code OR term prefix != '1'
+    is_uflex = ENRL_ACAD_CAREER == 'UFLEX' |
+               !str_starts(as.character(CLASS_TERM_CD), '1'),
+
+    CAREER_GROUP = case_when(
+      # 1. Wisconsin 60+ auditors — tracked separately, excluded from billing
+      ENRL_EMPLID %in% wi60_emplids & is_wi_resident & is_no_load ~ 'WI 60+ Audit',
+
+      # 2. UFlex
+      is_uflex                                                      ~ 'UFLEX',
+
+      # 3. Graduate
+      ENRL_ACAD_CAREER == 'GRAD'                                    ~ 'GRAD',
+
+      # 4. Undergraduate
+      ENRL_ACAD_CAREER == 'UGRD'                                    ~ 'UGRD',
+
+      TRUE                                                          ~ 'Other'
+    )
+  )
+
+# Spot-check career group distribution
+stud_classified %>%
+  count(CAREER_GROUP, ENRL_ACAD_CAREER, sort = TRUE)
+```
+
+## 3b — Graduate Students: Keep Graduate-Level Courses Only
+
+Graduate students sometimes enroll in undergraduate courses. For tuition
+projection purposes, only credit hours from **graduate-level classes**
+(`CLASS_ACAD_GROUP_LDESC` = 'Graduate' or similar) are counted toward the
+GRAD bucket. Review the values first.
+
+```{r grad-course-filter}
+# Review academic group values
+stud_classified %>%
+  filter(CAREER_GROUP == 'GRAD') %>%
+  count(CLASS_ACAD_GROUP_LDESC, sort = TRUE)
+```
+
+```{r apply-grad-filter}
+# ── UPDATE the grad_group_values vector to match your data ───────────────────
+grad_group_values <- c('Graduate')   # <-- confirm against output above
+
+stud_for_billing <- stud_classified %>%
+  filter(
+    # For GRAD: only graduate-level courses
+    !(CAREER_GROUP == 'GRAD' & !CLASS_ACAD_GROUP_LDESC %in% grad_group_values),
+    # Exclude WI 60+ auditors from the billing summary
+    CAREER_GROUP != 'WI 60+ Audit'
+  )
+```
+
+## 3c — Recode Midwest Exchange to Midwest Tuition Non-Resident
+
+UW-Parkside no longer participates in the Midwest Student Exchange. Any student
+whose tuition residency description contains "Midwest" and "Exchange" (or
+"Compact") is recoded to **Midwest Tuition Non-Resident**.
+
+```{r recode-midwest}
+# Review current Midwest-related residency labels before recoding
+stud_for_billing %>%
+  filter(str_detect(RES_TUITION_RES_LDESC, regex("midwest", ignore_case = TRUE))) %>%
+  count(RES_TUITION_RES_LDESC, sort = TRUE)
+```
+
+```{r apply-midwest-recode}
+stud_for_billing <- stud_for_billing %>%
+  mutate(
+    RES_TUITION_RES_LDESC = case_when(
+      str_detect(
+        RES_TUITION_RES_LDESC,
+        regex("midwest.*(exchange|compact)|exchange.*(midwest|compact)", ignore_case = TRUE)
+      ) ~ "Midwest Tuition Non-Resident",
+      TRUE ~ RES_TUITION_RES_LDESC
+    )
+  )
+
+# Confirm recoding
+stud_for_billing %>%
+  filter(str_detect(RES_TUITION_RES_LDESC, regex("midwest", ignore_case = TRUE))) %>%
+  count(RES_TUITION_RES_LDESC, sort = TRUE)
+```
+
+---
+
+# Step 4 — Credit Hours Summary by Term, Career Group, Residency, and Subject
+
+```{r credit-hour-summary}
+credit_hours_summary <- stud_for_billing %>%
+  group_by(
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_SDESC,
+    CAREER_GROUP,
+    RES_TUITION_RES_LDESC,
+    CLASS_SUBJECT_LDESC
+  ) %>%
+  summarise(
+    n_enrollments  = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, CAREER_GROUP,
+          RES_TUITION_RES_LDESC, CLASS_SUBJECT_LDESC)
+
+credit_hours_summary
+```
+
+---
+
+# Step 5 — Wisconsin 60+ Audit Summary (Separate, Not Billed)
+
+```{r wi60-summary}
+wi60_summary <- stud_classified %>%
+  filter(CAREER_GROUP == 'WI 60+ Audit') %>%
+  group_by(
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_SDESC,
+    CLASS_SUBJECT_LDESC
+  ) %>%
+  summarise(
+    n_enrollments      = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,  na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, CLASS_SUBJECT_LDESC)
+
+wi60_summary
+```
+
+---
+
+# Data Quality Checks
+
+```{r quality-checks}
+# Missingness
+stud_enroll_full %>%
+  summarise(
+    n_rows              = n(),
+    missing_career      = sum(is.na(ENRL_ACAD_CAREER)),
+    missing_term        = sum(is.na(CLASS_TERM_CD)),
+    missing_fa_load     = sum(is.na(CTERM_FA_LOAD_CODE)),
+    missing_residency   = sum(is.na(RES_RESIDENCY)),
+    missing_tuition_res = sum(is.na(RES_TUITION_RES_LDESC)),
+    missing_subject     = sum(is.na(CLASS_SUBJECT_LDESC))
+  )
+
+# Career group counts
+stud_classified %>%
+  count(CAREER_GROUP, sort = TRUE)
+
+# Residency distribution in billing data
+stud_for_billing %>%
+  count(CAREER_GROUP, RES_TUITION_RES_LDESC, sort = TRUE)
+```
