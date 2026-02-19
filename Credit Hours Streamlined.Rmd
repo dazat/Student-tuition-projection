@@ -67,7 +67,7 @@ ALL_TERMS         <- c(TRADITIONAL_TERMS, UFLEX_TERMS)
 
 # Connect RDS 
 
-```{r connect}
+```{r rds connect}
 
 con_rds <- dbConnect(
   odbc::odbc(),
@@ -80,6 +80,23 @@ con_rds <- dbConnect(
 
 ```
 
+
+# Connect CDR
+
+```{r cdr connect}
+
+# CDR
+con_cdr <- dbConnect(
+  odbc::odbc(),
+  dsn = "Oracle CDR",          # DSN handles driver + TNS service
+  uid = "UWGAXD",
+  pwd = keyring::key_get("oracle_cdr", "UWGAXD"),
+  timeout = 10
+)
+
+
+
+```
 
 
 ---
@@ -246,6 +263,8 @@ wi60_emplids <- stud_groups %>%
 ```{r close_connection}
 # Close the connection once all data is retrieved.
 dbDisconnect(con_rds)
+dbDisconnect(con_cdr)
+
 ```
 
 
