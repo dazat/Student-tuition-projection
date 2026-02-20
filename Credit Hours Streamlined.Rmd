@@ -254,30 +254,35 @@ cdr_year_term_pairs <- cdr_term_map %>%
   pull(pair) %>%
   paste(collapse = " OR ")
 
-stud_cdr <- dbGetQuery(
-  con_cdr,
-  sprintf(
-    "
-    SELECT
-      sc.CAMPUS_STUDENT_ID,
-      sc.YEAR,
-      sc.TERM,
-      sc.CLASSIF,        -- A/B/C/D=UG, S=65+, T=special 60+, J/O=UG special, E=masters
-      sc.RES_STATUS      -- R=Resident, N=NR general, E=Midwest Exchange, L=Midwest tuition,
-                         -- M=Michigan recip, S=MN recip, W=WI return disc, V=NR veteran,
-                         -- A=resident alumni, B=NR alumni
-    FROM UWSA.V_STUCRS sc
-    WHERE sc.UNIT = 'G'
-      AND sc.CAMPUS_STUDENT_ID IN (%s)
-      AND (%s)
-    ",
-    trad_emplids_sql,
-    cdr_year_term_pairs
+emplid_chunks <- split(trad_emplids, ceiling(seq_along(trad_emplids) / 1000))
+
+stud_cdr <- purrr::map_dfr(emplid_chunks, function(chunk) {
+  chunk_sql <- paste(sprintf("'%s'", chunk), collapse = ", ")
+  
+  dbGetQuery(
+    con_cdr,
+    sprintf(
+      "
+      SELECT
+        sc.CAMPUS_STUDENT_ID,
+        sc.YEAR,
+        sc.TERM,
+        sc.CLASSIF,
+        sc.RES_STATUS
+      FROM UWSA.V_STUCRS sc
+      WHERE sc.UNIT = 'G'
+        AND sc.CAMPUS_STUDENT_ID IN (%s)
+        AND (%s)
+      ",
+      chunk_sql,
+      cdr_year_term_pairs
+    )
   )
-)
+})
 
 # Join CDR term identifiers back to RDS CLASS_TERM_CD for merging
 stud_cdr <- stud_cdr %>%
+  mutate(YEAR = as.character(YEAR), TERM = as.character(TERM)) %>%
   left_join(
     cdr_term_map %>% mutate(YEAR = CDR_YEAR, TERM = CDR_TERM),
     by = c("YEAR", "TERM")
@@ -317,6 +322,8 @@ stud_combined %>%
     missing_classif = sum(is.na(CLASSIF)),
     missing_res_status = sum(is.na(RES_STATUS))
   )
+
+stud_combined %>% count(ENRL_ACAD_CAREER, sprt = TRUE)
 ```
 
 ---
@@ -340,12 +347,11 @@ stud_classified <- stud_combined %>%
     is_senior_65  = CLASSIF %in% c('S', 'T'),
     is_wi_res_cdr = RES_STATUS == 'R',
     is_no_load    = CTERM_FA_LOAD_CODE == 'N',
-    is_uflex      = ENRL_ACAD_CAREER == 'UFLEX' |
-                    !str_starts(as.character(CLASS_TERM_CD), '1'),
+    is_uflex      = ENRL_ACAD_CAREER == 'UFLX',
 
     CAREER_GROUP = case_when(
       is_senior_65 & is_wi_res_cdr & is_no_load ~ 'WI 65+ Audit',
-      is_uflex                                  ~ 'UFLEX',
+      is_uflex                                  ~ 'UFLX',
       ENRL_ACAD_CAREER == 'GRAD'                ~ 'GRAD',
       ENRL_ACAD_CAREER == 'UGRD'                ~ 'UGRD',
       TRUE                                      ~ 'Other'
@@ -389,6 +395,8 @@ back to the RDS `RES_TUITION_RES_LDESC` field and apply the same Exchange recode
 via text matching as a safety net.
 
 ```{r assign-residency}
+
+
 stud_for_billing <- stud_for_billing %>%
   mutate(
     RESIDENCY_CATEGORY = case_when(
@@ -420,10 +428,15 @@ stud_for_billing <- stud_for_billing %>%
     )
   )
 
+getOption("na.print")  # see what it's currently set to
+options(na.print = "NA")  # reset to default
+
 # Verify residency category distribution
 stud_for_billing %>%
   count(CAREER_GROUP, RESIDENCY_CATEGORY, sort = TRUE) %>%
+  as_tibble() %>%
   print(n = 40)
+
 ```
 
 ---
