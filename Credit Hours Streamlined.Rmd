@@ -287,7 +287,10 @@ stud_cdr <- stud_cdr %>%
     cdr_term_map %>% mutate(YEAR = CDR_YEAR, TERM = CDR_TERM),
     by = c("YEAR", "TERM")
   ) %>%
-  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS)
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS) %>%
+  # V_STUCRS is course-grain; deduplicate to one row per student x term
+  # so the subsequent left join does not create row-multiplying duplicates
+  distinct()
 
 # Spot-check CDR values
 cat("CLASSIF distribution:\n")
@@ -308,6 +311,9 @@ dbDisconnect(con_cdr)
 
 ```{r join-rds-cdr}
 stud_combined <- stud_enroll_full %>%
+  # Oracle returns EMPLID as numeric; CDR returns CAMPUS_STUDENT_ID as character.
+  # Coerce before joining to avoid a type-mismatch silent non-match.
+  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
   left_join(
     stud_cdr,
     by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID", "CLASS_TERM_CD")
@@ -347,11 +353,15 @@ stud_classified <- stud_combined %>%
     is_senior_65  = CLASSIF %in% c('S', 'T'),
     is_wi_res_cdr = RES_STATUS == 'R',
     is_no_load    = CTERM_FA_LOAD_CODE == 'N',
-    is_uflex      = ENRL_ACAD_CAREER == 'UFLX',
+    # Identify UFlex by BOTH career code (handles UFLX or UFLEX) AND term-code
+    # prefix (5/6), so UFlex students enrolled under an unexpected career code
+    # are still caught.
+    is_uflex      = ENRL_ACAD_CAREER %in% c('UFLEX', 'UFLX') |
+                    !str_starts(as.character(CLASS_TERM_CD), "1"),
 
     CAREER_GROUP = case_when(
       is_senior_65 & is_wi_res_cdr & is_no_load ~ 'WI 65+ Audit',
-      is_uflex                                  ~ 'UFLX',
+      is_uflex                                  ~ 'UFLEX',
       ENRL_ACAD_CAREER == 'GRAD'                ~ 'GRAD',
       ENRL_ACAD_CAREER == 'UGRD'                ~ 'UGRD',
       TRUE                                      ~ 'Other'
@@ -444,22 +454,36 @@ stud_for_billing %>%
 # Step 5 — Credit Hours Summary
 
 ```{r credit-hour-summary}
+# Grain: one row per student x term x subject.
+# A student can take multiple classes in the same subject in the same term, so
+# credit hours are summed within that grain.  Student-level attributes
+# (CLASSIF, RES_STATUS, ENRL_ACAD_CAREER, CTERM_FA_LOAD_CODE) are constant
+# within a student x term and are preserved as group-by keys so they appear
+# on every output row.
 credit_hours_summary <- stud_for_billing %>%
   group_by(
+    ENRL_EMPLID,
     CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
     CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
     CAREER_GROUP,
+    CLASSIF,
+    RES_STATUS,
     RESIDENCY_CATEGORY,
-    CLASS_SUBJECT_LDESC
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
   ) %>%
   summarise(
-    n_enrollments      = n(),
+    n_classes          = n(),
     credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
     credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, CAREER_GROUP,
-          RESIDENCY_CATEGORY, CLASS_SUBJECT_LDESC)
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID,
+          CLASS_SUBJECT_LDESC)
 
 credit_hours_summary
 ```
