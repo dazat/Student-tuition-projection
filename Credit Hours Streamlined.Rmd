@@ -383,6 +383,7 @@ stud_classified %>%
   count(CLASS_ACAD_GROUP_LDESC, sort = TRUE)
 ```
 
+
 ```{r apply-grad-filter}
 # Confirm 'Graduate' is the correct label in your data and update if needed
 GRAD_COURSE_GROUPS <- c('Graduate')
@@ -392,6 +393,7 @@ stud_for_billing <- stud_classified %>%
     !(CAREER_GROUP == 'GRAD' & !CLASS_ACAD_GROUP_LDESC %in% GRAD_COURSE_GROUPS),
     CAREER_GROUP != 'WI 65+ Audit'
   )
+
 ```
 
 ## 4c — Assign Residency Category
