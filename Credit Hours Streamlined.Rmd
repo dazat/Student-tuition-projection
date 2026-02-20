@@ -27,7 +27,7 @@ projections. Students are grouped into the following **career categories**:
 |---|---|
 | **UGRD** | Traditional undergraduate (resident or non-resident) |
 | **GRAD** | Graduate students — graduate-level courses only |
-| **UFLEX** | University Flex (term code prefix 5 or 6, or `ENRL_ACAD_CAREER == 'UFLEX'`) |
+| **UFLX** | University Flex (term code prefix 5 or 6, or `ENRL_ACAD_CAREER == 'UFLX'`) |
 | **WI 65+ Audit** | WI-resident students with `CLASSIF` S or T, enrolled no-load — tracked separately, excluded from billing |
 
 Residency uses CDR `RES_STATUS` codes for traditional students (authoritative
@@ -342,7 +342,7 @@ Classification priority (applied in order):
 
 1. **WI 65+ Audit** — `CLASSIF %in% c('S', 'T')` AND `RES_STATUS == 'R'` AND
    `CTERM_FA_LOAD_CODE == 'N'`
-2. **UFLEX** — `ENRL_ACAD_CAREER == 'UFLEX'` OR term code does not start with `'1'`
+2. **UFLX** — `ENRL_ACAD_CAREER == 'UFLX'` OR term code does not start with `'1'`
 3. **GRAD** — `ENRL_ACAD_CAREER == 'GRAD'`
 4. **UGRD** — `ENRL_ACAD_CAREER == 'UGRD'`
 5. **Other** — review and reclassify as needed
@@ -353,15 +353,14 @@ stud_classified <- stud_combined %>%
     is_senior_65  = CLASSIF %in% c('S', 'T'),
     is_wi_res_cdr = RES_STATUS == 'R',
     is_no_load    = CTERM_FA_LOAD_CODE == 'N',
-    # Identify UFlex by BOTH career code (handles UFLX or UFLEX) AND term-code
-    # prefix (5/6), so UFlex students enrolled under an unexpected career code
-    # are still caught.
-    is_uflex      = ENRL_ACAD_CAREER %in% c('UFLEX', 'UFLX') |
+    # Identify UFlex by BOTH career code ('UFLX') AND term-code prefix (5/6),
+    # so UFlex students enrolled under an unexpected career code are still caught.
+    is_uflex      = ENRL_ACAD_CAREER == 'UFLX' |
                     !str_starts(as.character(CLASS_TERM_CD), "1"),
 
     CAREER_GROUP = case_when(
       is_senior_65 & is_wi_res_cdr & is_no_load ~ 'WI 65+ Audit',
-      is_uflex                                  ~ 'UFLEX',
+      is_uflex                                  ~ 'UFLX',
       ENRL_ACAD_CAREER == 'GRAD'                ~ 'GRAD',
       ENRL_ACAD_CAREER == 'UGRD'                ~ 'UGRD',
       TRUE                                      ~ 'Other'
