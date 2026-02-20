@@ -396,45 +396,56 @@ stud_for_billing <- stud_classified %>%
 
 ## 4c — Assign Residency Category
 
-For **traditional students**, CDR `RES_STATUS` is the authoritative source.
-`RES_STATUS = 'E'` (Midwest Exchange) is recoded to **Midwest Tuition Non-Resident**.
+CDR `RES_STATUS` is the authoritative source and is used first for **all**
+students when available.  `RES_STATUS = 'E'` (Midwest Exchange) is recoded to
+**Midwest Tuition Non-Resident**.
 
-For **UFlex students**, `RES_STATUS` will be `NA` (not in CDR), so we fall
-back to the RDS `RES_TUITION_RES_LDESC` field and apply the same Exchange recode
-via text matching as a safety net.
+When CDR `RES_STATUS` is missing (UFlex students are not in CDR; a small number
+of traditional students may also lack CDR records), we fill in from the RDS
+`RES_TUITION_RES_LDESC` field.  Both source columns (`CDR_RESIDENCY_CATEGORY`
+and `RDS_RESIDENCY_CATEGORY`) are retained so the two sources can be compared
+directly.  `RESIDENCY_SOURCE` records which source determined the final
+`RESIDENCY_CATEGORY`.
 
 ```{r assign-residency}
 
-
 stud_for_billing <- stud_for_billing %>%
   mutate(
-    RESIDENCY_CATEGORY = case_when(
 
-      # ── Traditional students: use CDR RES_STATUS ───────────────────────────
-      !is_uflex & RES_STATUS == 'R' ~ 'Resident',
-      !is_uflex & RES_STATUS == 'A' ~ 'Resident - Alumni Discount',
-      !is_uflex & RES_STATUS == 'E' ~ 'Midwest Tuition Non-Resident',   # recoded from Exchange
-      !is_uflex & RES_STATUS == 'L' ~ 'Midwest Tuition Non-Resident',
-      !is_uflex & RES_STATUS == 'M' ~ 'Non-Resident - Michigan Reciprocity',
-      !is_uflex & RES_STATUS == 'S' ~ 'Non-Resident - Minnesota Reciprocity',
-      !is_uflex & RES_STATUS == 'W' ~ 'Non-Resident - Wisconsin Return Discount',
-      !is_uflex & RES_STATUS == 'V' ~ 'Non-Resident - Veteran',
-      !is_uflex & RES_STATUS == 'B' ~ 'Non-Resident - Alumni Discount',
-      !is_uflex & RES_STATUS == 'N' ~ 'Non-Resident',
-      !is_uflex & !is.na(RES_STATUS) ~ paste0('Non-Resident - Other (', RES_STATUS, ')'),
+    # ── Step 1: map CDR RES_STATUS to a category (NA when CDR has no record) ──
+    CDR_RESIDENCY_CATEGORY = case_when(
+      RES_STATUS == 'R' ~ 'Resident',
+      RES_STATUS == 'A' ~ 'Resident - Alumni Discount',
+      RES_STATUS == 'E' ~ 'Midwest Tuition Non-Resident',   # recoded from Exchange
+      RES_STATUS == 'L' ~ 'Midwest Tuition Non-Resident',
+      RES_STATUS == 'M' ~ 'Non-Resident - Michigan Reciprocity',
+      RES_STATUS == 'S' ~ 'Non-Resident - Minnesota Reciprocity',
+      RES_STATUS == 'W' ~ 'Non-Resident - Wisconsin Return Discount',
+      RES_STATUS == 'V' ~ 'Non-Resident - Veteran',
+      RES_STATUS == 'B' ~ 'Non-Resident - Alumni Discount',
+      RES_STATUS == 'N' ~ 'Non-Resident',
+      !is.na(RES_STATUS) ~ paste0('Non-Resident - Other (', RES_STATUS, ')'),
+      TRUE               ~ NA_character_
+    ),
 
-      # ── UFlex students: fall back to RDS residency description ─────────────
-      is_uflex ~ case_when(
-        str_detect(
-          RES_TUITION_RES_LDESC,
-          regex("midwest.*(exchange|compact)|exchange.*(midwest|compact)", ignore_case = TRUE)
-        )                            ~ 'Midwest Tuition Non-Resident',
-        !is.na(RES_TUITION_RES_LDESC) ~ RES_TUITION_RES_LDESC,
-        TRUE                         ~ 'Unknown'
-      ),
+    # ── Step 2: map RDS RES_TUITION_RES_LDESC to a category (NA when missing) ─
+    RDS_RESIDENCY_CATEGORY = case_when(
+      str_detect(
+        RES_TUITION_RES_LDESC,
+        regex("midwest.*(exchange|compact)|exchange.*(midwest|compact)", ignore_case = TRUE)
+      )                             ~ 'Midwest Tuition Non-Resident',
+      !is.na(RES_TUITION_RES_LDESC) ~ RES_TUITION_RES_LDESC,
+      TRUE                          ~ NA_character_
+    ),
 
-      TRUE ~ 'Unknown'
-    )
+    # ── Step 3: CDR first; fall back to RDS; mark source ─────────────────────
+    RESIDENCY_SOURCE = case_when(
+      !is.na(CDR_RESIDENCY_CATEGORY) ~ 'CDR',
+      !is.na(RDS_RESIDENCY_CATEGORY) ~ 'RDS',
+      TRUE                           ~ 'Unknown'
+    ),
+
+    RESIDENCY_CATEGORY = coalesce(CDR_RESIDENCY_CATEGORY, RDS_RESIDENCY_CATEGORY, 'Unknown')
   )
 
 getOption("na.print")  # see what it's currently set to
@@ -442,19 +453,17 @@ options(na.print = "NA")  # reset to default
 
 # Verify residency category distribution
 stud_for_billing %>%
-  count(CAREER_GROUP, RESIDENCY_CATEGORY, sort = TRUE) %>%
+  count(CAREER_GROUP, RESIDENCY_SOURCE, RESIDENCY_CATEGORY, sort = TRUE) %>%
   as_tibble() %>%
-  print(n = 40)
+  print(n = 50)
 
 ```
 
-## 4d — Investigate Unknown Residency
+## 4d — Investigate Unknown Residency and CDR vs RDS Agreement
 
-Any row where `RESIDENCY_CATEGORY == 'Unknown'` signals a gap: either the
-student has no CDR `RES_STATUS` (and is not UFlex), or the UFlex
-`RES_TUITION_RES_LDESC` value didn't match any expected label.  The checks
-below identify whether the problem is concentrated in a specific career group,
-term, or raw residency value so it can be resolved upstream or recoded.
+Any row where `RESIDENCY_CATEGORY == 'Unknown'` means both CDR and RDS had no
+usable residency value.  The checks below also compare CDR and RDS where both
+are populated so disagreements can be reviewed and resolved upstream.
 
 ```{r residency-unknown}
 unknown_res <- stud_for_billing %>%
@@ -468,34 +477,54 @@ unknown_res %>%
   count(CAREER_GROUP, sort = TRUE) %>%
   print()
 
-# 2. For traditional students (UGRD/GRAD): what raw CDR RES_STATUS value
-#    is present (or missing) that wasn't mapped?
-cat("\n--- Traditional students: raw RES_STATUS values ---\n")
+# 2. What raw CDR and RDS values are present (or missing) for unknowns?
+cat("\n--- Unknown rows: raw RES_STATUS (CDR) values ---\n")
 unknown_res %>%
-  filter(!is_uflex) %>%
   count(RES_STATUS, sort = TRUE) %>%
   print()
 
-# 3. For UFlex students: what raw RDS residency description didn't match?
-cat("\n--- UFlex students: raw RES_TUITION_RES_LDESC values ---\n")
+cat("\n--- Unknown rows: raw RES_TUITION_RES_LDESC (RDS) values ---\n")
 unknown_res %>%
-  filter(is_uflex) %>%
   count(RES_TUITION_RES_LDESC, sort = TRUE) %>%
   print()
 
-# 4. Is Unknown concentrated in particular terms?
+# 3. Is Unknown concentrated in particular terms?
 cat("\n--- By term ---\n")
 unknown_res %>%
   count(CLASS_TERM_CD, CLASS_TERM_SDESC, CAREER_GROUP, sort = TRUE) %>%
   print()
 
-# 5. Sample rows — inspect all residency-related raw fields side by side
+# 4. Sample unknown rows — all residency-related raw fields side by side
 cat("\n--- Sample rows (up to 20 distinct students) ---\n")
 unknown_res %>%
   select(ENRL_EMPLID, CLASS_TERM_CD, CAREER_GROUP, CLASSIF,
-         RES_STATUS, RES_TUITION_RES_LDESC, RESIDENCY_CATEGORY) %>%
+         RES_STATUS, CDR_RESIDENCY_CATEGORY,
+         RES_TUITION_RES_LDESC, RDS_RESIDENCY_CATEGORY,
+         RESIDENCY_SOURCE, RESIDENCY_CATEGORY) %>%
   distinct() %>%
   slice_head(n = 20) %>%
+  print()
+
+# 5. CDR vs RDS agreement where both sources are populated
+cat("\n--- CDR vs RDS agreement (both sources populated) ---\n")
+stud_for_billing %>%
+  filter(!is.na(CDR_RESIDENCY_CATEGORY) & !is.na(RDS_RESIDENCY_CATEGORY)) %>%
+  mutate(sources_agree = CDR_RESIDENCY_CATEGORY == RDS_RESIDENCY_CATEGORY) %>%
+  count(sources_agree) %>%
+  print()
+
+cat("\n--- Disagreements: CDR vs RDS residency category ---\n")
+stud_for_billing %>%
+  filter(!is.na(CDR_RESIDENCY_CATEGORY),
+         !is.na(RDS_RESIDENCY_CATEGORY),
+         CDR_RESIDENCY_CATEGORY != RDS_RESIDENCY_CATEGORY) %>%
+  count(CAREER_GROUP, CDR_RESIDENCY_CATEGORY, RDS_RESIDENCY_CATEGORY, sort = TRUE) %>%
+  print()
+
+# 6. Summary of how many rows used each source
+cat("\n--- Rows resolved by source ---\n")
+stud_for_billing %>%
+  count(CAREER_GROUP, RESIDENCY_SOURCE, sort = TRUE) %>%
   print()
 ```
 
