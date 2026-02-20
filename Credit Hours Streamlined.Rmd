@@ -27,7 +27,7 @@ projections. Students are grouped into the following **career categories**:
 |---|---|
 | **UGRD** | Traditional undergraduate (resident or non-resident) |
 | **GRAD** | Graduate students — graduate-level courses only |
-| **UFLEX** | University Flex (term code prefix 5 or 6, or `ENRL_ACAD_CAREER == 'UFLEX'`) |
+| **UFLX** | University Flex (term code prefix 5 or 6, or `ENRL_ACAD_CAREER == 'UFLX'`) |
 | **WI 65+ Audit** | WI-resident students with `CLASSIF` S or T, enrolled no-load — tracked separately, excluded from billing |
 
 Residency uses CDR `RES_STATUS` codes for traditional students (authoritative
@@ -287,7 +287,10 @@ stud_cdr <- stud_cdr %>%
     cdr_term_map %>% mutate(YEAR = CDR_YEAR, TERM = CDR_TERM),
     by = c("YEAR", "TERM")
   ) %>%
-  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS)
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS) %>%
+  # V_STUCRS is course-grain; deduplicate to one row per student x term
+  # so the subsequent left join does not create row-multiplying duplicates
+  distinct()
 
 # Spot-check CDR values
 cat("CLASSIF distribution:\n")
@@ -308,6 +311,9 @@ dbDisconnect(con_cdr)
 
 ```{r join-rds-cdr}
 stud_combined <- stud_enroll_full %>%
+  # Oracle returns EMPLID as numeric; CDR returns CAMPUS_STUDENT_ID as character.
+  # Coerce before joining to avoid a type-mismatch silent non-match.
+  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
   left_join(
     stud_cdr,
     by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID", "CLASS_TERM_CD")
@@ -336,7 +342,7 @@ Classification priority (applied in order):
 
 1. **WI 65+ Audit** — `CLASSIF %in% c('S', 'T')` AND `RES_STATUS == 'R'` AND
    `CTERM_FA_LOAD_CODE == 'N'`
-2. **UFLEX** — `ENRL_ACAD_CAREER == 'UFLEX'` OR term code does not start with `'1'`
+2. **UFLX** — `ENRL_ACAD_CAREER == 'UFLX'` OR term code does not start with `'1'`
 3. **GRAD** — `ENRL_ACAD_CAREER == 'GRAD'`
 4. **UGRD** — `ENRL_ACAD_CAREER == 'UGRD'`
 5. **Other** — review and reclassify as needed
@@ -347,7 +353,10 @@ stud_classified <- stud_combined %>%
     is_senior_65  = CLASSIF %in% c('S', 'T'),
     is_wi_res_cdr = RES_STATUS == 'R',
     is_no_load    = CTERM_FA_LOAD_CODE == 'N',
-    is_uflex      = ENRL_ACAD_CAREER == 'UFLX',
+    # Identify UFlex by BOTH career code ('UFLX') AND term-code prefix (5/6),
+    # so UFlex students enrolled under an unexpected career code are still caught.
+    is_uflex      = ENRL_ACAD_CAREER == 'UFLX' |
+                    !str_starts(as.character(CLASS_TERM_CD), "1"),
 
     CAREER_GROUP = case_when(
       is_senior_65 & is_wi_res_cdr & is_no_load ~ 'WI 65+ Audit',
@@ -439,29 +448,162 @@ stud_for_billing %>%
 
 ```
 
+## 4d — Investigate Unknown Residency
+
+Any row where `RESIDENCY_CATEGORY == 'Unknown'` signals a gap: either the
+student has no CDR `RES_STATUS` (and is not UFlex), or the UFlex
+`RES_TUITION_RES_LDESC` value didn't match any expected label.  The checks
+below identify whether the problem is concentrated in a specific career group,
+term, or raw residency value so it can be resolved upstream or recoded.
+
+```{r residency-unknown}
+unknown_res <- stud_for_billing %>%
+  filter(RESIDENCY_CATEGORY == 'Unknown')
+
+cat("Total 'Unknown' residency rows:", nrow(unknown_res), "\n\n")
+
+# 1. Which career groups are affected?
+cat("--- By CAREER_GROUP ---\n")
+unknown_res %>%
+  count(CAREER_GROUP, sort = TRUE) %>%
+  print()
+
+# 2. For traditional students (UGRD/GRAD): what raw CDR RES_STATUS value
+#    is present (or missing) that wasn't mapped?
+cat("\n--- Traditional students: raw RES_STATUS values ---\n")
+unknown_res %>%
+  filter(!is_uflex) %>%
+  count(RES_STATUS, sort = TRUE) %>%
+  print()
+
+# 3. For UFlex students: what raw RDS residency description didn't match?
+cat("\n--- UFlex students: raw RES_TUITION_RES_LDESC values ---\n")
+unknown_res %>%
+  filter(is_uflex) %>%
+  count(RES_TUITION_RES_LDESC, sort = TRUE) %>%
+  print()
+
+# 4. Is Unknown concentrated in particular terms?
+cat("\n--- By term ---\n")
+unknown_res %>%
+  count(CLASS_TERM_CD, CLASS_TERM_SDESC, CAREER_GROUP, sort = TRUE) %>%
+  print()
+
+# 5. Sample rows — inspect all residency-related raw fields side by side
+cat("\n--- Sample rows (up to 20 distinct students) ---\n")
+unknown_res %>%
+  select(ENRL_EMPLID, CLASS_TERM_CD, CAREER_GROUP, CLASSIF,
+         RES_STATUS, RES_TUITION_RES_LDESC, RESIDENCY_CATEGORY) %>%
+  distinct() %>%
+  slice_head(n = 20) %>%
+  print()
+```
+
 ---
 
-# Step 5 — Credit Hours Summary
+# Step 5 — Credit Hours Summaries by Career Group
 
-```{r credit-hour-summary}
-credit_hours_summary <- stud_for_billing %>%
+Separate tables are produced for each billing bucket so they can be used
+independently for tuition rate calculations.
+
+Grain for all three: one row per **student × term × subject**.  A student
+taking two sections of the same subject in the same term has their credit
+hours summed into a single row.
+
+```{r credit-hours-ugrd}
+credit_hours_ugrd <- stud_for_billing %>%
+  filter(CAREER_GROUP == 'UGRD') %>%
   group_by(
+    ENRL_EMPLID,
     CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
     CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
     CAREER_GROUP,
+    CLASSIF,
+    RES_STATUS,
     RESIDENCY_CATEGORY,
-    CLASS_SUBJECT_LDESC
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
   ) %>%
   summarise(
-    n_enrollments      = n(),
+    n_classes          = n(),
     credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
     credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, CAREER_GROUP,
-          RESIDENCY_CATEGORY, CLASS_SUBJECT_LDESC)
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID,
+          CLASS_SUBJECT_LDESC)
 
-credit_hours_summary
+cat("Undergraduate — rows:", nrow(credit_hours_ugrd),
+    "| credit hrs taken:", sum(credit_hours_ugrd$credit_hrs_taken), "\n")
+credit_hours_ugrd
+```
+
+```{r credit-hours-grad}
+credit_hours_grad <- stud_for_billing %>%
+  filter(CAREER_GROUP == 'GRAD') %>%
+  group_by(
+    ENRL_EMPLID,
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
+    CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
+    CAREER_GROUP,
+    CLASSIF,
+    RES_STATUS,
+    RESIDENCY_CATEGORY,
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
+  ) %>%
+  summarise(
+    n_classes          = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID,
+          CLASS_SUBJECT_LDESC)
+
+cat("Graduate — rows:", nrow(credit_hours_grad),
+    "| credit hrs taken:", sum(credit_hours_grad$credit_hrs_taken), "\n")
+credit_hours_grad
+```
+
+```{r credit-hours-uflx}
+credit_hours_uflx <- stud_for_billing %>%
+  filter(CAREER_GROUP == 'UFLX') %>%
+  group_by(
+    ENRL_EMPLID,
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
+    CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
+    CAREER_GROUP,
+    CLASSIF,
+    RES_STATUS,
+    RESIDENCY_CATEGORY,
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
+  ) %>%
+  summarise(
+    n_classes          = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID,
+          CLASS_SUBJECT_LDESC)
+
+cat("UFlex — rows:", nrow(credit_hours_uflx),
+    "| credit hrs taken:", sum(credit_hours_uflx$credit_hrs_taken), "\n")
+credit_hours_uflx
 ```
 
 ---
