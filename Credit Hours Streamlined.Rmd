@@ -25,8 +25,8 @@ projections. Students are grouped into the following **career categories**:
 
 | Category | Description |
 |---|---|
-| **UGRD** | Traditional undergraduate (resident or non-resident) |
-| **GRAD** | Graduate students — graduate-level courses only |
+| **UGRD** | Traditional undergraduate (resident or non-resident) | `CLASSIF` = A, B, C, D and maybe J, N and O
+| **GRAD** | Graduate students — graduate-level courses only | `CLASSIF` = E and maybe K, G, H
 | **UFLX** | University Flex (term code prefix 5 or 6, or `ENRL_ACAD_CAREER == 'UFLX'`) |
 | **WI 65+ Audit** | WI-resident students with `CLASSIF` S or T, enrolled no-load — tracked separately, excluded from billing |
 
@@ -35,6 +35,8 @@ single-character codes). Students with `RES_STATUS = 'E'` (Midwest Exchange)
 are recoded to **Midwest Tuition Non-Resident** since UW-Parkside no longer
 participates in that program. UFlex students are not in CDR; their residency
 falls back to the RDS `RES_TUITION_RES_LDESC` field.
+
+However we must also examine if a student has a any residency status, even if not for the specific term when grouping then select the most recent `RES_STATUS`. We will have to use `YEAR` as unfortunately there is no effective date. So essentially, if the student observation has `CLASSIF` and `RES_STATUS` info for the `YEAR` then use that, if not, pull forward the most recent observation for that student. 
 
 **CDR `RES_STATUS` key:**
 
@@ -62,6 +64,7 @@ falls back to the RDS `RES_TUITION_RES_LDESC` field.
 | S | Senior over 65 |
 | T | Special classification (potentially 60+; verify) |
 | J | Undergraduate special |
+| N | Undergraduate special |
 | O | Undergraduate special |
 | E | Master's student |
 
@@ -500,6 +503,9 @@ unknown_res %>%
   slice_head(n = 20) %>%
   print()
 ```
+
+
+*We should also examine when CLASSIF is NA as that is key information as well*
 
 ---
 
