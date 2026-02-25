@@ -241,6 +241,14 @@ traditional-term students. UFlex students are **not** in CDR.
 
 Join key: CDR `CAMPUS_STUDENT_ID` = RDS `ENRL_EMPLID`.
 
+Two queries are issued per student chunk:
+
+1. **In-scope terms** — the specific `(YEAR, TERM)` pairs matching the
+   traditional terms being analysed.
+2. **Full history** — all `(YEAR, TERM)` records for the same students, used
+   in Step 2b to fill forward any `NA` `CLASSIF` or `RES_STATUS` values from
+   the student's most recent prior term.
+
 ```{r pull-cdr}
 # Build enrolled EMPLID list for traditional terms only
 trad_emplids <- stud_enroll_full %>%
@@ -295,17 +303,159 @@ stud_cdr <- stud_cdr %>%
   # so the subsequent left join does not create row-multiplying duplicates
   distinct()
 
-# Spot-check CDR values
-cat("CLASSIF distribution:\n")
+# Spot-check CDR values for in-scope terms (pre fill-forward baseline)
+cat("CLASSIF distribution (in-scope terms, before fill-forward):\n")
 stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
-cat("\nRES_STATUS distribution:\n")
+cat("\nRES_STATUS distribution (in-scope terms, before fill-forward):\n")
 stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
+
+# ── Secondary pull: all CDR records for these students (fill-forward) ────────
+# Fetches ALL years/terms so we can backfill CLASSIF and RES_STATUS when a
+# student has no record — or a NA value — for a specific in-scope term.
+stud_cdr_history <- purrr::map_dfr(emplid_chunks, function(chunk) {
+  chunk_sql <- paste(sprintf("'%s'", chunk), collapse = ", ")
+
+  dbGetQuery(
+    con_cdr,
+    sprintf(
+      "
+      SELECT
+        sc.CAMPUS_STUDENT_ID,
+        sc.YEAR,
+        sc.TERM,
+        sc.CLASSIF,
+        sc.RES_STATUS
+      FROM UWSA.V_STUCRS sc
+      WHERE sc.UNIT = 'G'
+        AND sc.CAMPUS_STUDENT_ID IN (%s)
+      ",
+      chunk_sql
+    )
+  )
+}) %>%
+  mutate(YEAR = as.character(YEAR), TERM = as.character(TERM))
 ```
 
 ```{r disconnect}
 # Close connections — all data is now in R
 dbDisconnect(con_rds)
 dbDisconnect(con_cdr)
+```
+
+---
+
+# Step 2b — Fill Forward Missing CLASSIF and RES_STATUS from Prior Terms
+
+For traditional students, the CDR `V_STUCRS` record for a specific term may
+be absent or have a `NA` value for `CLASSIF` or `RES_STATUS`.  The rules are:
+
+- **CLASSIF**: if `NA` for the in-scope term, use the value from the student's
+  most recent *prior* CDR term that has a non-`NA` `CLASSIF`.
+- **RES_STATUS**: if `NA` for the in-scope term, use the value from the
+  student's most recent *prior* CDR term that has a non-`NA` `RES_STATUS`.
+
+Ordering uses a composite `YEAR_TERM_SORT` key:
+`YEAR × 10 + term-position`, where term positions are
+Fall (1) < Winter (2) < Spring (3) < Summer (4).
+
+```{r fill-forward-cdr}
+# ── Helper: build YEAR_TERM_SORT from character YEAR and TERM columns ────────
+make_year_term_sort <- function(year_chr, term_chr) {
+  term_num <- case_when(
+    term_chr == '1' ~ 1L,   # Fall
+    term_chr == 'W' ~ 2L,   # Winter
+    term_chr == '2' ~ 3L,   # Spring
+    term_chr == 'S' ~ 4L,   # Summer
+    TRUE            ~ 9L
+  )
+  as.integer(year_chr) * 10L + term_num
+}
+
+# Sort key for every in-scope term (links CLASS_TERM_CD to a comparable integer)
+scope_sort <- cdr_term_map %>%
+  mutate(YEAR_TERM_SORT = make_year_term_sort(CDR_YEAR, CDR_TERM)) %>%
+  select(CLASS_TERM_CD, YEAR_TERM_SORT)
+
+# Add the sort key to the full CDR history
+stud_cdr_history <- stud_cdr_history %>%
+  mutate(YEAR_TERM_SORT = make_year_term_sort(YEAR, TERM))
+
+# ── CLASSIF lookup: one non-NA value per student × historical term ───────────
+# If multiple records exist for the same student × term, keep the first
+# non-NA CLASSIF (CLASSIF is a student-level attribute; multiple rows arise
+# because V_STUCRS is course-grain).
+classif_lookup <- stud_cdr_history %>%
+  filter(!is.na(CLASSIF)) %>%
+  distinct(CAMPUS_STUDENT_ID, YEAR_TERM_SORT, CLASSIF) %>%
+  group_by(CAMPUS_STUDENT_ID, YEAR_TERM_SORT) %>%
+  slice(1L) %>%
+  ungroup()
+
+# ── RES_STATUS lookup: one non-NA value per student × historical term ────────
+res_status_lookup <- stud_cdr_history %>%
+  filter(!is.na(RES_STATUS)) %>%
+  distinct(CAMPUS_STUDENT_ID, YEAR_TERM_SORT, RES_STATUS) %>%
+  group_by(CAMPUS_STUDENT_ID, YEAR_TERM_SORT) %>%
+  slice(1L) %>%
+  ungroup()
+
+# Attach the sort key to the in-scope CDR data
+stud_cdr <- stud_cdr %>%
+  left_join(scope_sort, by = "CLASS_TERM_CD")
+
+# ── Fill-forward CLASSIF ──────────────────────────────────────────────────────
+# For each student × term where CLASSIF is NA, cross-join to all prior
+# historical CLASSIF records (HIST_SORT < current YEAR_TERM_SORT), then
+# keep only the single most-recent prior match.
+classif_ff <- stud_cdr %>%
+  filter(is.na(CLASSIF)) %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, YEAR_TERM_SORT) %>%
+  left_join(
+    classif_lookup %>%
+      rename(HIST_SORT = YEAR_TERM_SORT, CLASSIF_FF = CLASSIF),
+    by           = "CAMPUS_STUDENT_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(HIST_SORT < YEAR_TERM_SORT) %>%
+  group_by(CAMPUS_STUDENT_ID, CLASS_TERM_CD) %>%
+  slice_max(HIST_SORT, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF_FF)
+
+# ── Fill-forward RES_STATUS ───────────────────────────────────────────────────
+# Same pattern as CLASSIF: use the most recent prior term with a non-NA value.
+res_status_ff <- stud_cdr %>%
+  filter(is.na(RES_STATUS)) %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, YEAR_TERM_SORT) %>%
+  left_join(
+    res_status_lookup %>%
+      rename(HIST_SORT = YEAR_TERM_SORT, RES_STATUS_FF = RES_STATUS),
+    by           = "CAMPUS_STUDENT_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(HIST_SORT < YEAR_TERM_SORT) %>%
+  group_by(CAMPUS_STUDENT_ID, CLASS_TERM_CD) %>%
+  slice_max(HIST_SORT, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, RES_STATUS_FF)
+
+# ── Merge fill-forward values back into stud_cdr and clean up ────────────────
+stud_cdr <- stud_cdr %>%
+  left_join(classif_ff,    by = c("CAMPUS_STUDENT_ID", "CLASS_TERM_CD")) %>%
+  left_join(res_status_ff, by = c("CAMPUS_STUDENT_ID", "CLASS_TERM_CD")) %>%
+  mutate(
+    CLASSIF    = coalesce(CLASSIF,    CLASSIF_FF),
+    RES_STATUS = coalesce(RES_STATUS, RES_STATUS_FF)
+  ) %>%
+  select(-YEAR_TERM_SORT, -CLASSIF_FF, -RES_STATUS_FF)
+
+cat("CLASSIF fill-forward:    applied to", nrow(classif_ff),    "student × term rows\n")
+cat("RES_STATUS fill-forward: applied to", nrow(res_status_ff), "student × term rows\n")
+
+cat("\nCLASSIF distribution (after fill-forward):\n")
+stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
+cat("\nRES_STATUS distribution (after fill-forward):\n")
+stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
 ```
 
 ---
