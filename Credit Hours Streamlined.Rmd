@@ -74,11 +74,12 @@ However we must also examine if a student has a any residency status, even if no
 
 ```{r term-reference}
 # ── Traditional terms (CLASS_TERM_CD begins with 1) ──────────────────────────
+# 1255 = Spring 2024-2025
 # 1257 = Summer 2024–2025
 # 1261 = Fall   2025–2026
 # 1263 = Winter 2025–2026
-# 1265 = Spring 2025–2026
-# 1267 = Summer 2025–2026
+# 1265 = Spring 2025–2026 (Include but won't have CLASSIF)
+# 1267 = Summer 2025–2026 (Exclude)
 
 # ── UFlex terms (CLASS_TERM_CD begins with 5 or 6) ───────────────────────────
 # 6506 = Jun–Aug 2025    6507 = Jul–Sep 2025    6508 = Aug–Oct 2025
@@ -86,7 +87,7 @@ However we must also examine if a student has a any residency status, even if no
 # 6512 = Dec–Feb 2026    6601 = Jan–Mar 2026    6602 = Feb–Apr 2026
 # 6603 = Mar–May 2026
 
-TRADITIONAL_TERMS <- c('1257', '1261', '1263', '1265', '1267')
+TRADITIONAL_TERMS <- c('1255', '1257', '1261', '1263', '1265')
 UFLEX_TERMS       <- c('6506', '6507', '6508', '6509', '6510',
                         '6511', '6512', '6601', '6602', '6603')
 ALL_TERMS         <- c(TRADITIONAL_TERMS, UFLEX_TERMS)
@@ -95,14 +96,16 @@ ALL_TERMS         <- c(TRADITIONAL_TERMS, UFLEX_TERMS)
 # CDR YEAR = 6-digit academic year (e.g., 202526 = AY 2025-2026)
 # CDR TERM: 1 = Fall, 2 = Spring, S = Summer
 # Note: verify Winter (1263) and Summer (1267) year assignments with CDR team
+
 cdr_term_map <- tribble(
   ~CLASS_TERM_CD, ~CDR_YEAR,  ~CDR_TERM,
+  '1255',         '202425',   '2',   # Spring 2024-2025
   '1257',         '202425',   'S',   # Summer 2024-2025
   '1261',         '202526',   '1',   # Fall   2025-2026
   '1263',         '202526',   'W',   # Winter 2025-2026 (verify if CDR has winter)
   '1265',         '202526',   '2',   # Spring 2025-2026
-  '1267',         '202526',   'S'    # Summer 2025-2026 (verify year assignment)
 )
+
 ```
 
 ---
@@ -110,6 +113,7 @@ cdr_term_map <- tribble(
 # Connect to Databases
 
 ```{r connect}
+
 con_rds <- dbConnect(
   odbc::odbc(),
   dsn     = "Oracle RDS",
@@ -125,6 +129,7 @@ con_cdr <- dbConnect(
   pwd     = keyring::key_get("oracle_cdr", "UWGAXD"),
   timeout = 10
 )
+
 ```
 
 ---
@@ -142,6 +147,7 @@ One consolidated query joins:
 **L** = Less than half, **N** = No load (audit / non-credit).
 
 ```{r pull-rds}
+
 all_terms_sql <- paste(sprintf("'%s'", ALL_TERMS), collapse = ", ")
 
 stud_enroll_full <- dbGetQuery(
@@ -178,7 +184,7 @@ stud_enroll_full <- dbGetQuery(
         st.CTERM_ACAD_YEAR,
         st.CTERM_TERM_SDESC,
         st.CTERM_ACAD_LOAD_SDESC,
-        st.CTERM_ACAD_LEVEL_BOT_LDESC,
+        st.CTERM_ACAD_LEVEL_BOT_LDESC, -- Undergraduate Special
         st.CTERM_FA_LOAD_CODE         -- F = Full load, N = No load (audit), L = less than full time, T = three quarters, H = half time
       FROM PKS_RDS_USR.REC_STUDENT_TERM_DIM_V st
       WHERE st.CTERM_INSTITUTION_CODE = 'UWPKS'
@@ -230,6 +236,7 @@ stud_enroll_full <- dbGetQuery(
     all_terms_sql
   )
 )
+
 ```
 
 ---
@@ -250,6 +257,7 @@ Two queries are issued per student chunk:
    the student's most recent prior term.
 
 ```{r pull-cdr}
+
 # Build enrolled EMPLID list for traditional terms only
 trad_emplids <- stud_enroll_full %>%
   filter(str_starts(as.character(CLASS_TERM_CD), "1")) %>%
@@ -334,7 +342,39 @@ stud_cdr_history <- purrr::map_dfr(emplid_chunks, function(chunk) {
   )
 }) %>%
   mutate(YEAR = as.character(YEAR), TERM = as.character(TERM))
+
+
+
+
+# CLASSIF distribution (in-scope terms, before fill-forward):
+#   CLASSIF  n
+#      D 1813
+#      E 1546
+#      A 1492
+#      C 1456
+#      B 1268
+#      N  959
+#      J   50
+#      O   46
+#      S   12
+#    <NA>    4
+#       K    2
+# 
+# RES_STATUS distribution (in-scope terms, before fill-forward):
+#   RES_STATUS  n
+#          R 7203
+#          N 1133
+#          L  290
+#          S   11
+#          V    9
+#          E    2
+
+
 ```
+
+
+
+        
 
 ```{r disconnect}
 # Close connections — all data is now in R
@@ -359,6 +399,7 @@ Ordering uses a composite `YEAR_TERM_SORT` key:
 Fall (1) < Winter (2) < Spring (3) < Summer (4).
 
 ```{r fill-forward-cdr}
+
 # ── Helper: build YEAR_TERM_SORT from character YEAR and TERM columns ────────
 make_year_term_sort <- function(year_chr, term_chr) {
   term_num <- case_when(
@@ -449,6 +490,8 @@ stud_cdr <- stud_cdr %>%
   ) %>%
   select(-YEAR_TERM_SORT, -CLASSIF_FF, -RES_STATUS_FF)
 
+
+
 cat("CLASSIF fill-forward:    applied to", nrow(classif_ff),    "student × term rows\n")
 cat("RES_STATUS fill-forward: applied to", nrow(res_status_ff), "student × term rows\n")
 
@@ -456,13 +499,191 @@ cat("\nCLASSIF distribution (after fill-forward):\n")
 stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
 cat("\nRES_STATUS distribution (after fill-forward):\n")
 stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
+
+
+
 ```
+
+Missing data check
+
+```{r}
+
+stud_enroll_full %>%
+  left_join(stud_cdr, by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID", 
+                               "CLASS_TERM_CD")) %>%
+  summarise(
+    total_rows       = n(),
+    missing_classif  = sum(is.na(CLASSIF)),
+    missing_res      = sum(is.na(RES_STATUS)),
+    missing_both     = sum(is.na(CLASSIF) & is.na(RES_STATUS))
+  )
+
+stud_enroll_full %>%
+  left_join(stud_cdr, by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID",
+                               "CLASS_TERM_CD")) %>%
+  mutate(has_cdr = !is.na(CLASSIF) | !is.na(RES_STATUS)) %>%
+  count(CLASS_TERM_CD, has_cdr) %>%
+  arrange(CLASS_TERM_CD, has_cdr)
+
+```
+
+## Fixing CLASSIF from RDS data
+
+```{r}
+
+## ── Merge fill-forward classif from RDS level ───────────────
+# Step 1: RDS-based CLASSIF recode as a fallback source
+rds_classif_fallback <- stud_enroll_full %>%
+  distinct(ENRL_EMPLID, CLASS_TERM_CD, CTERM_ACAD_LEVEL_BOT_LDESC) %>%
+  mutate(CLASSIF_RDS = case_when(
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Freshman"              ~ "A",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Sophomore"             ~ "B",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Junior"                ~ "C",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Senior"                ~ "D",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Graduate"              ~ "E",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Undergraduate Special" ~ "J",
+    TRUE ~ NA_character_
+  ))
+
+# Step 2: Join and apply as third-tier fallback after CDR fill-forward
+stud_enroll_full <- stud_enroll_full %>%
+  left_join(stud_cdr, by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID",
+                               "CLASS_TERM_CD")) %>%
+  left_join(rds_classif_fallback, 
+            by = c("ENRL_EMPLID", "CLASS_TERM_CD")) %>%
+  mutate(
+    CLASSIF_FINAL    = coalesce(CLASSIF, CLASSIF_RDS),
+    CLASSIF_SOURCE   = case_when(
+      !is.na(CLASSIF)     ~ "CDR",
+      !is.na(CLASSIF_RDS) ~ "RDS",
+      TRUE                ~ "Missing"
+    )
+  )
+
+
+```
+
+
+
+Missing data check post RDS fix
+
+```{r}
+
+stud_enroll_full %>%
+  summarise(
+    total_rows       = n(),
+    missing_classif  = sum(is.na(CLASSIF)),
+    missing_classif_final  = sum(is.na(CLASSIF_FINAL)),
+    missing_res      = sum(is.na(RES_STATUS)),
+    missing_both     = sum(is.na(CLASSIF_FINAL) & is.na(RES_STATUS))
+  )
+
+
+```
+
+## Fixing RES_STATUS from RDS data
+
+```{r}
+
+# ── Residency comparison inspection ─────────────────────────────────────────
+
+# Step 1: High level summary of missingness
+stud_enroll_full %>%
+  summarise(
+    total_rows        = n(),
+    missing_res_status    = sum(is.na(RES_STATUS)),
+    missing_res_residency = sum(is.na(RES_RESIDENCY)),
+    missing_both          = sum(is.na(RES_STATUS) & is.na(RES_RESIDENCY)),
+    present_both          = sum(!is.na(RES_STATUS) & !is.na(RES_RESIDENCY))
+  )
+
+# Step 2: Where RES_STATUS is missing, what does RES_RESIDENCY look like?
+# This tells you if RDS can fill the gap
+stud_enroll_full %>%
+  filter(is.na(RES_STATUS)) %>%
+  count(RES_RESIDENCY, sort = TRUE)
+
+
+# #2a check both res_status and res_residency
+stud_enroll_full %>%
+  filter(!is.na(RES_STATUS)) %>%
+  count(RES_RESIDENCY, RES_STATUS, sort = TRUE) %>%
+  arrange(RES_RESIDENCY, RES_STATUS)
+
+
+# Step 3: Where both are present, how often do they agree vs disagree?
+# Collapse RES_STATUS to R vs N for comparison since RDS likely won't
+# have the nuanced codes (A, B, V, L, etc.)
+stud_enroll_full %>%
+  filter(!is.na(RES_STATUS), !is.na(RES_RESIDENCY)) %>%
+  mutate(
+    RES_STATUS_SIMPLE = case_when(
+      RES_STATUS %in% c("R", "A")                    ~ "Resident",
+      RES_STATUS %in% c("N", "B", "V", "L", 
+                         "M", "S", "W", "E")         ~ "Non-Resident",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  count(RES_STATUS_SIMPLE, RES_RESIDENCY, sort = TRUE)
+
+# Step 4: By term — is disagreement or missingness concentrated anywhere?
+stud_enroll_full %>%
+  mutate(
+    res_situation = case_when(
+      is.na(RES_STATUS) & is.na(RES_RESIDENCY) ~ "Both missing",
+      is.na(RES_STATUS) & !is.na(RES_RESIDENCY) ~ "Only RDS present",
+      !is.na(RES_STATUS) & is.na(RES_RESIDENCY) ~ "Only CDR present",
+      TRUE ~ "Both present"
+    )
+  ) %>%
+  count(CLASS_TERM_CD, res_situation) %>%
+  arrange(CLASS_TERM_CD, res_situation)
+
+
+```
+
+
+## Fix RES_STATUS from RDS data
+
+```{r}
+
+
+stud_enroll_full <- stud_enroll_full %>%
+  mutate(
+    RES_STATUS_RDS = case_when(
+      RES_RESIDENCY == "R" ~ "R",
+      RES_RESIDENCY == "N" ~ "N",
+      RES_RESIDENCY == "D" ~ "L",
+      RES_RESIDENCY == "S" ~ "S",
+      RES_RESIDENCY == "E" ~ "E",
+      TRUE ~ NA_character_
+    ),
+    RES_STATUS_FINAL  = coalesce(RES_STATUS, RES_STATUS_RDS),
+    RES_STATUS_SOURCE = case_when(
+      !is.na(RES_STATUS)     ~ "CDR",
+      !is.na(RES_STATUS_RDS) ~ "RDS",
+      TRUE                   ~ "Missing"
+    )
+  )
+
+# Audit the result
+stud_enroll_full %>%
+  count(RES_STATUS_SOURCE, sort = TRUE)
+
+# Check residual missing
+stud_enroll_full %>%
+  filter(RES_STATUS_SOURCE == "Missing") %>%
+  count(CLASS_TERM_CD, sort = TRUE)
+
+```
+
 
 ---
 
 # Step 3 — Join RDS and CDR Data
 
 ```{r join-rds-cdr}
+
 stud_combined <- stud_enroll_full %>%
   # Oracle returns EMPLID as numeric; CDR returns CAMPUS_STUDENT_ID as character.
   # Coerce before joining to avoid a type-mismatch silent non-match.
@@ -482,8 +703,16 @@ stud_combined %>%
     missing_res_status = sum(is.na(RES_STATUS))
   )
 
-stud_combined %>% count(ENRL_ACAD_CAREER, sprt = TRUE)
+stud_combined %>% count(ENRL_ACAD_CAREER, sort = TRUE)
+
+stud_combined %>% summarise(n = n_distinct())
+
 ```
+According to the output:
+GRAD		4951		
+UFLX		2038		
+UGRD		36391	
+
 
 ---
 
