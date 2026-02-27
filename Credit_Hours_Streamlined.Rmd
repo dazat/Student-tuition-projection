@@ -1,0 +1,922 @@
+---
+title: "Credit Hours by Program — Streamlined"
+author: "Tony Daza"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(DBI)
+library(dplyr)
+library(stringr)
+library(odbc)
+library(keyring)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+```
+
+# Overview
+
+This document calculates credit hours by program (subject) for tuition revenue
+projections. Students are grouped into the following **career categories**:
+
+| Category | Description |
+|---|---|
+| **UGRD** | Traditional undergraduate (resident or non-resident) — `CLASSIF_FINAL` = A, B, C, D, J, N, O |
+| **GRAD** | Graduate students — graduate-level courses only — `CLASSIF_FINAL` = E |
+| **UFLX** | University Flex (term code prefix 5 or 6, or `ENRL_ACAD_CAREER == 'UFLX'`) |
+| **WI 65+ Audit** | WI-resident students with `CLASSIF_FINAL` S or T, enrolled no-load — tracked separately, excluded from billing |
+
+Residency uses CDR `RES_STATUS` codes for traditional students (authoritative
+single-character codes). Students with `RES_STATUS = 'E'` (Midwest Exchange)
+are recoded to **Midwest Tuition Non-Resident** since UW-Parkside no longer
+participates in that program. UFlex students are not in CDR; their residency
+falls back to the RDS `RES_TUITION_RES_LDESC` field.
+
+**Data source hierarchy (applied in order):**
+
+1. CDR `V_STUCRS` for the in-scope term — authoritative for `CLASSIF` and `RES_STATUS`
+2. CDR fill-forward — most recent prior CDR term for the same student
+3. RDS fallback — `CTERM_ACAD_LEVEL_BOT_LDESC` for `CLASSIF`; `RES_RESIDENCY` for `RES_STATUS`
+
+**CDR `RES_STATUS` key:**
+
+| Code | Meaning |
+|---|---|
+| R | Resident |
+| A | Resident — alumni discount |
+| B | Non-Resident — alumni discount |
+| V | Non-Resident — veteran |
+| L | Non-Resident — Midwest tuition |
+| M | Non-Resident — Michigan reciprocity |
+| S | Non-Resident — Minnesota reciprocity |
+| W | Non-Resident — Wisconsin return discount |
+| E | Non-Resident — Midwest Exchange *(recoded → Midwest Tuition Non-Resident)* |
+| N | Non-Resident — general |
+
+**CDR `CLASSIF` key (from `V_STUCRS`):**
+
+| Code | Meaning |
+|---|---|
+| A | Freshman |
+| B | Sophomore |
+| C | Junior |
+| D | Senior |
+| S | Senior over 65 |
+| T | Special classification (potentially 60+; verify) |
+| J | Undergraduate special |
+| N | Undergraduate special |
+| O | Undergraduate special |
+| E | Master's student |
+
+---
+
+# Term Reference
+
+```{r term-reference}
+# ── Traditional terms (CLASS_TERM_CD begins with 1) ──────────────────────────
+# 1255 = Spring 2024-2025
+# 1257 = Summer 2024–2025
+# 1261 = Fall   2025–2026
+# 1263 = Winter 2025–2026
+# 1265 = Spring 2025–2026 (Include but CDR record may be incomplete)
+# 1267 = Summer 2025–2026 (Exclude)
+
+# ── UFlex terms (CLASS_TERM_CD begins with 5 or 6) ───────────────────────────
+# 6506 = Jun–Aug 2025    6507 = Jul–Sep 2025    6508 = Aug–Oct 2025
+# 6509 = Sep–Nov 2025    6510 = Oct–Dec 2025    6511 = Nov–Jan 2026
+# 6512 = Dec–Feb 2026    6601 = Jan–Mar 2026    6602 = Feb–Apr 2026
+# 6603 = Mar–May 2026
+
+TRADITIONAL_TERMS <- c('1255', '1257', '1261', '1263', '1265')
+UFLEX_TERMS       <- c('6506', '6507', '6508', '6509', '6510',
+                        '6511', '6512', '6601', '6602', '6603')
+ALL_TERMS         <- c(TRADITIONAL_TERMS, UFLEX_TERMS)
+
+# ── CDR term mapping (traditional terms only; UFlex not in CDR) ───────────────
+# CDR YEAR = 6-digit academic year (e.g., 202526 = AY 2025-2026)
+# CDR TERM: 1 = Fall, W = Winter, 2 = Spring, S = Summer
+# Note: verify Winter (1263) CDR year assignment with CDR team
+
+cdr_term_map <- tribble(
+  ~CLASS_TERM_CD, ~CDR_YEAR,  ~CDR_TERM,
+  '1255',         '202425',   '2',   # Spring 2024-2025
+  '1257',         '202425',   'S',   # Summer 2024-2025
+  '1261',         '202526',   '1',   # Fall   2025-2026
+  '1263',         '202526',   'W',   # Winter 2025-2026 (verify if CDR has winter)
+  '1265',         '202526',   '2',   # Spring 2025-2026
+)
+```
+
+---
+
+# Connect to Databases
+
+```{r connect}
+con_rds <- dbConnect(
+  odbc::odbc(),
+  dsn     = "Oracle RDS",
+  uid     = "DAZA",
+  pwd     = keyring::key_get("oracle_rds", "DAZA"),
+  timeout = 10
+)
+
+con_cdr <- dbConnect(
+  odbc::odbc(),
+  dsn     = "Oracle CDR",
+  uid     = "UWGAXD",
+  pwd     = keyring::key_get("oracle_cdr", "UWGAXD"),
+  timeout = 10
+)
+```
+
+---
+
+# Step 1 — Pull Enrollment, Class, Student-Term, and Residency from RDS
+
+One consolidated query joins:
+
+- `REC_ENROLLMENT_FACT_V` — one row per student per class
+- `REC_CLASS_DIM_V` — class metadata (subject, academic group, term)
+- `REC_STUDENT_TERM_DIM_V` — student term record (career, load code, academic level)
+- `CC_RESIDENCY_DIM_V` — most-recent residency effective on or before the enrollment term
+
+`CTERM_FA_LOAD_CODE`: **F** = Full, **T** = Three-quarter, **H** = Half,
+**L** = Less than half, **N** = No load (audit / non-credit).
+
+```{r pull-rds}
+all_terms_sql <- paste(sprintf("'%s'", ALL_TERMS), collapse = ", ")
+
+stud_enroll_full <- dbGetQuery(
+  con_rds,
+  sprintf(
+    "
+    WITH enroll AS (
+      SELECT
+        e.CTERM_SID,
+        e.CLASS_SID,
+        e.ENRL_EMPLID,
+        e.ENRL_ACAD_CAREER,
+        e.ENRL_UNITS_TAKEN,
+        e.ENRL_UNITS_BILLING,
+        e.ENRL_STATUS_SDESC,
+        c.CLASS_TERM_CD,
+        c.CLASS_TERM_SDESC,
+        c.CLASS_TERM_ACAD_YEAR,
+        c.CLASS_ACAD_GROUP_LDESC,
+        c.CLASS_ACAD_ORG_LDESC,
+        c.CLASS_SUBJECT_LDESC
+      FROM PKS_RDS_USR.REC_ENROLLMENT_FACT_V e
+      JOIN PKS_RDS_USR.REC_CLASS_DIM_V c
+        ON c.CLASS_SID = e.CLASS_SID
+      WHERE c.CLASS_INSTITUTION_CD = 'UWPKS'
+        AND c.CLASS_TERM_CD IN (%s)
+    ),
+    stud_term AS (
+      SELECT
+        st.CTERM_SID,
+        st.CTERM_EMPLID,
+        st.CTERM_TERM_CD,
+        st.CTERM_CATEGORY_SDESC,
+        st.CTERM_ACAD_YEAR,
+        st.CTERM_TERM_SDESC,
+        st.CTERM_ACAD_LOAD_SDESC,
+        st.CTERM_ACAD_LEVEL_BOT_LDESC,
+        st.CTERM_FA_LOAD_CODE
+      FROM PKS_RDS_USR.REC_STUDENT_TERM_DIM_V st
+      WHERE st.CTERM_INSTITUTION_CODE = 'UWPKS'
+        AND st.CTERM_TERM_CD IN (%s)
+    ),
+    res_ranked AS (
+      SELECT
+        en.ENRL_EMPLID,
+        en.CLASS_TERM_CD,
+        r.RES_ACAD_CAREER_SDESC,
+        r.RES_EFFECTIVE_TERM,
+        r.RES_RESIDENCY,
+        r.RES_RESIDENCY_LDESC,
+        r.RES_TUITION_RES_SDESC,
+        r.RES_TUITION_RES_LDESC,
+        r.RES_RESIDENCY_DT,
+        ROW_NUMBER() OVER (
+          PARTITION BY en.ENRL_EMPLID, en.CLASS_TERM_CD
+          ORDER BY r.RES_EFFECTIVE_TERM DESC, r.RES_RESIDENCY_DT DESC
+        ) AS rn
+      FROM enroll en
+      LEFT JOIN PKS_RDS_USR.CC_RESIDENCY_DIM_V r
+        ON  r.RES_EMPLID      = en.ENRL_EMPLID
+        AND r.RES_INSTITUTION = 'UWPKS'
+        AND r.RES_EFFECTIVE_TERM <= en.CLASS_TERM_CD
+    )
+    SELECT
+      en.*,
+      st.CTERM_CATEGORY_SDESC,
+      st.CTERM_ACAD_LOAD_SDESC,
+      st.CTERM_ACAD_LEVEL_BOT_LDESC,
+      st.CTERM_FA_LOAD_CODE,
+      rr.RES_EFFECTIVE_TERM,
+      rr.RES_RESIDENCY,
+      rr.RES_RESIDENCY_LDESC,
+      rr.RES_TUITION_RES_SDESC,
+      rr.RES_TUITION_RES_LDESC
+    FROM enroll en
+    LEFT JOIN stud_term st
+      ON  st.CTERM_SID     = en.CTERM_SID
+      AND st.CTERM_EMPLID  = en.ENRL_EMPLID
+      AND st.CTERM_TERM_CD = en.CLASS_TERM_CD
+    LEFT JOIN res_ranked rr
+      ON  rr.ENRL_EMPLID   = en.ENRL_EMPLID
+      AND rr.CLASS_TERM_CD = en.CLASS_TERM_CD
+      AND rr.rn = 1
+    ",
+    all_terms_sql,
+    all_terms_sql
+  )
+)
+
+cat("RDS rows pulled:", nrow(stud_enroll_full), "\n")
+cat("Distinct students:", n_distinct(stud_enroll_full$ENRL_EMPLID), "\n")
+```
+
+---
+
+# Step 2 — Pull Student Classification and Residency from CDR (`V_STUCRS`)
+
+CDR `V_STUCRS` (UWSA) provides authoritative `CLASSIF` and `RES_STATUS` for
+traditional-term students. UFlex students are **not** in CDR.
+
+Join key: CDR `CAMPUS_STUDENT_ID` = RDS `ENRL_EMPLID`.
+
+Two queries are issued per student chunk:
+
+1. **In-scope terms** — the specific `(YEAR, TERM)` pairs matching the traditional terms being analysed.
+2. **Full history** — all `(YEAR, TERM)` records for the same students, used in Step 3 to fill forward any `NA` `CLASSIF` or `RES_STATUS` values.
+
+```{r pull-cdr}
+# Build enrolled EMPLID list for traditional terms only
+trad_emplids <- stud_enroll_full %>%
+  filter(str_starts(as.character(CLASS_TERM_CD), "1")) %>%
+  distinct(ENRL_EMPLID) %>%
+  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
+  pull(ENRL_EMPLID)
+
+# Build (YEAR, TERM) pairs from the mapping table for the WHERE clause
+cdr_year_term_pairs <- cdr_term_map %>%
+  mutate(pair = sprintf("(YEAR = '%s' AND TERM = '%s')", CDR_YEAR, CDR_TERM)) %>%
+  pull(pair) %>%
+  paste(collapse = " OR ")
+
+# Chunk EMPLIDs to respect Oracle IN clause limit (~1000 values)
+emplid_chunks <- split(trad_emplids, ceiling(seq_along(trad_emplids) / 1000))
+
+# ── Primary pull: in-scope terms only ────────────────────────────────────────
+stud_cdr <- purrr::map_dfr(emplid_chunks, function(chunk) {
+  chunk_sql <- paste(sprintf("'%s'", chunk), collapse = ", ")
+
+  dbGetQuery(
+    con_cdr,
+    sprintf(
+      "
+      SELECT
+        sc.CAMPUS_STUDENT_ID,
+        sc.YEAR,
+        sc.TERM,
+        sc.CLASSIF,
+        sc.RES_STATUS
+      FROM UWSA.V_STUCRS sc
+      WHERE sc.UNIT = 'G'
+        AND sc.CAMPUS_STUDENT_ID IN (%s)
+        AND (%s)
+      ",
+      chunk_sql,
+      cdr_year_term_pairs
+    )
+  )
+})
+
+# Join CDR term identifiers back to RDS CLASS_TERM_CD for merging
+stud_cdr <- stud_cdr %>%
+  mutate(YEAR = as.character(YEAR), TERM = as.character(TERM)) %>%
+  left_join(
+    cdr_term_map %>% mutate(YEAR = CDR_YEAR, TERM = CDR_TERM),
+    by = c("YEAR", "TERM")
+  ) %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS) %>%
+  # V_STUCRS is course-grain; deduplicate to one row per student x term
+  distinct()
+
+cat("CLASSIF distribution (in-scope terms, before fill-forward):\n")
+stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
+cat("\nRES_STATUS distribution (in-scope terms, before fill-forward):\n")
+stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
+
+# ── Secondary pull: full CDR history for fill-forward ────────────────────────
+stud_cdr_history <- purrr::map_dfr(emplid_chunks, function(chunk) {
+  chunk_sql <- paste(sprintf("'%s'", chunk), collapse = ", ")
+
+  dbGetQuery(
+    con_cdr,
+    sprintf(
+      "
+      SELECT
+        sc.CAMPUS_STUDENT_ID,
+        sc.YEAR,
+        sc.TERM,
+        sc.CLASSIF,
+        sc.RES_STATUS
+      FROM UWSA.V_STUCRS sc
+      WHERE sc.UNIT = 'G'
+        AND sc.CAMPUS_STUDENT_ID IN (%s)
+      ",
+      chunk_sql
+    )
+  )
+}) %>%
+  mutate(YEAR = as.character(YEAR), TERM = as.character(TERM))
+```
+
+```{r disconnect}
+# Close connections — all data is now in R
+dbDisconnect(con_rds)
+dbDisconnect(con_cdr)
+```
+
+---
+
+# Step 3 — Fill Forward Missing CLASSIF and RES_STATUS from Prior CDR Terms
+
+For traditional students, the CDR `V_STUCRS` record for a specific term may
+be absent or have a `NA` value. The rules are:
+
+- **CLASSIF**: if `NA` for the in-scope term, use the value from the student's most recent *prior* CDR term.
+- **RES_STATUS**: if `NA` for the in-scope term, use the value from the student's most recent *prior* CDR term.
+
+Ordering uses a composite `YEAR_TERM_SORT` key: `YEAR × 10 + term-position`,
+where Fall (1) < Winter (2) < Spring (3) < Summer (4).
+
+```{r fill-forward-cdr}
+# ── Helper: build YEAR_TERM_SORT from character YEAR and TERM columns ─────────
+make_year_term_sort <- function(year_chr, term_chr) {
+  term_num <- case_when(
+    term_chr == '1' ~ 1L,   # Fall
+    term_chr == 'W' ~ 2L,   # Winter
+    term_chr == '2' ~ 3L,   # Spring
+    term_chr == 'S' ~ 4L,   # Summer
+    TRUE            ~ 9L
+  )
+  as.integer(year_chr) * 10L + term_num
+}
+
+# Sort key for every in-scope term
+scope_sort <- cdr_term_map %>%
+  mutate(YEAR_TERM_SORT = make_year_term_sort(CDR_YEAR, CDR_TERM)) %>%
+  select(CLASS_TERM_CD, YEAR_TERM_SORT)
+
+# Add sort key to full CDR history
+stud_cdr_history <- stud_cdr_history %>%
+  mutate(YEAR_TERM_SORT = make_year_term_sort(YEAR, TERM))
+
+# ── CLASSIF lookup: one non-NA value per student × historical term ────────────
+classif_lookup <- stud_cdr_history %>%
+  filter(!is.na(CLASSIF)) %>%
+  distinct(CAMPUS_STUDENT_ID, YEAR_TERM_SORT, CLASSIF) %>%
+  group_by(CAMPUS_STUDENT_ID, YEAR_TERM_SORT) %>%
+  slice(1L) %>%
+  ungroup()
+
+# ── RES_STATUS lookup: one non-NA value per student × historical term ─────────
+res_status_lookup <- stud_cdr_history %>%
+  filter(!is.na(RES_STATUS)) %>%
+  distinct(CAMPUS_STUDENT_ID, YEAR_TERM_SORT, RES_STATUS) %>%
+  group_by(CAMPUS_STUDENT_ID, YEAR_TERM_SORT) %>%
+  slice(1L) %>%
+  ungroup()
+
+# Attach sort key to in-scope CDR data
+stud_cdr <- stud_cdr %>%
+  left_join(scope_sort, by = "CLASS_TERM_CD")
+
+# ── Fill-forward CLASSIF ──────────────────────────────────────────────────────
+classif_ff <- stud_cdr %>%
+  filter(is.na(CLASSIF)) %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, YEAR_TERM_SORT) %>%
+  left_join(
+    classif_lookup %>%
+      rename(HIST_SORT = YEAR_TERM_SORT, CLASSIF_FF = CLASSIF),
+    by           = "CAMPUS_STUDENT_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(HIST_SORT < YEAR_TERM_SORT) %>%
+  group_by(CAMPUS_STUDENT_ID, CLASS_TERM_CD) %>%
+  slice_max(HIST_SORT, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF_FF)
+
+# ── Fill-forward RES_STATUS ───────────────────────────────────────────────────
+res_status_ff <- stud_cdr %>%
+  filter(is.na(RES_STATUS)) %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, YEAR_TERM_SORT) %>%
+  left_join(
+    res_status_lookup %>%
+      rename(HIST_SORT = YEAR_TERM_SORT, RES_STATUS_FF = RES_STATUS),
+    by           = "CAMPUS_STUDENT_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(HIST_SORT < YEAR_TERM_SORT) %>%
+  group_by(CAMPUS_STUDENT_ID, CLASS_TERM_CD) %>%
+  slice_max(HIST_SORT, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, RES_STATUS_FF)
+
+# ── Merge fill-forward values back into stud_cdr ─────────────────────────────
+stud_cdr <- stud_cdr %>%
+  left_join(classif_ff,    by = c("CAMPUS_STUDENT_ID", "CLASS_TERM_CD")) %>%
+  left_join(res_status_ff, by = c("CAMPUS_STUDENT_ID", "CLASS_TERM_CD")) %>%
+  mutate(
+    CLASSIF    = coalesce(CLASSIF,    CLASSIF_FF),
+    RES_STATUS = coalesce(RES_STATUS, RES_STATUS_FF)
+  ) %>%
+  select(-YEAR_TERM_SORT, -CLASSIF_FF, -RES_STATUS_FF)
+
+cat("CLASSIF fill-forward:    applied to", nrow(classif_ff),    "student × term rows\n")
+cat("RES_STATUS fill-forward: applied to", nrow(res_status_ff), "student × term rows\n")
+
+cat("\nCLASSIF distribution (after CDR fill-forward):\n")
+stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
+cat("\nRES_STATUS distribution (after CDR fill-forward):\n")
+stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
+```
+
+---
+
+# Step 4 — Join RDS and CDR Data
+
+```{r join-rds-cdr}
+stud_combined <- stud_enroll_full %>%
+  # Oracle returns EMPLID as numeric; CDR returns CAMPUS_STUDENT_ID as character.
+  # Coerce before joining to avoid a type-mismatch silent non-match.
+  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
+  left_join(
+    stud_cdr,
+    by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID", "CLASS_TERM_CD")
+  )
+
+# CDR fields will be NA for UFlex students (expected — they are not in CDR)
+stud_combined %>%
+  mutate(is_uflex = !str_starts(as.character(CLASS_TERM_CD), "1")) %>%
+  group_by(is_uflex) %>%
+  summarise(
+    n_rows             = n(),
+    missing_classif    = sum(is.na(CLASSIF)),
+    missing_res_status = sum(is.na(RES_STATUS))
+  )
+
+cat("\nCareer distribution:\n")
+stud_combined %>% count(ENRL_ACAD_CAREER, sort = TRUE) %>% print()
+
+cat("\nDistinct students:", n_distinct(stud_combined$ENRL_EMPLID), "\n")
+```
+
+---
+
+# Step 5 — Apply RDS Fallbacks for CLASSIF and RES_STATUS
+
+For students with no CDR record (primarily UFlex, Spring 2025, and some
+non-traditional students), RDS fields provide a third-tier fallback.
+
+**CLASSIF fallback source:** `CTERM_ACAD_LEVEL_BOT_LDESC`
+**RES_STATUS fallback source:** `RES_RESIDENCY`
+
+`CLASSIF_SOURCE` and `RES_STATUS_SOURCE` flags are retained for audit purposes.
+
+## 5a — CLASSIF Fallback from RDS
+
+```{r classif-rds-fallback}
+# Build RDS-based CLASSIF recode from student term level description
+rds_classif_fallback <- stud_combined %>%
+  distinct(ENRL_EMPLID, CLASS_TERM_CD, CTERM_ACAD_LEVEL_BOT_LDESC) %>%
+  mutate(CLASSIF_RDS = case_when(
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Freshman"              ~ "A",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Sophomore"             ~ "B",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Junior"                ~ "C",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Senior"                ~ "D",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Graduate"              ~ "E",
+    CTERM_ACAD_LEVEL_BOT_LDESC == "Undergraduate Special" ~ "J",
+    TRUE ~ NA_character_
+  ))
+
+# Apply as third-tier fallback: CDR → CDR fill-forward → RDS
+stud_combined <- stud_combined %>%
+  left_join(rds_classif_fallback, by = c("ENRL_EMPLID", "CLASS_TERM_CD")) %>%
+  mutate(
+    CLASSIF_FINAL  = coalesce(CLASSIF, CLASSIF_RDS),
+    CLASSIF_SOURCE = case_when(
+      !is.na(CLASSIF)     ~ "CDR",
+      !is.na(CLASSIF_RDS) ~ "RDS",
+      TRUE                ~ "Missing"
+    )
+  )
+
+cat("CLASSIF source distribution:\n")
+stud_combined %>% count(CLASSIF_SOURCE, sort = TRUE) %>% print()
+
+cat("\nCLASSIF_FINAL distribution:\n")
+stud_combined %>% count(CLASSIF_FINAL, sort = TRUE) %>% print()
+```
+
+## 5b — RES_STATUS Fallback from RDS
+
+RDS `RES_RESIDENCY` codes map to CDR `RES_STATUS` as follows (confirmed by
+crosswalk of rows where both fields are present):
+
+| RES_RESIDENCY | RES_STATUS | Meaning |
+|---|---|---|
+| R | R | Resident |
+| N | N | Non-Resident — general |
+| D | L | Non-Resident — Midwest Tuition |
+| S | S | Non-Resident — Minnesota reciprocity |
+| E | E | Non-Resident — Midwest Exchange |
+
+```{r res-status-rds-fallback}
+stud_combined <- stud_combined %>%
+  mutate(
+    RES_STATUS_RDS = case_when(
+      RES_RESIDENCY == "R" ~ "R",
+      RES_RESIDENCY == "N" ~ "N",
+      RES_RESIDENCY == "D" ~ "L",
+      RES_RESIDENCY == "S" ~ "S",
+      RES_RESIDENCY == "E" ~ "E",
+      TRUE ~ NA_character_
+    ),
+    RES_STATUS_FINAL  = coalesce(RES_STATUS, RES_STATUS_RDS),
+    RES_STATUS_SOURCE = case_when(
+      !is.na(RES_STATUS)     ~ "CDR",
+      !is.na(RES_STATUS_RDS) ~ "RDS",
+      TRUE                   ~ "Missing"
+    )
+  )
+
+cat("RES_STATUS source distribution:\n")
+stud_combined %>% count(RES_STATUS_SOURCE, sort = TRUE) %>% print()
+
+cat("\nResidual missing RES_STATUS by term:\n")
+stud_combined %>%
+  filter(RES_STATUS_SOURCE == "Missing") %>%
+  count(CLASS_TERM_CD, sort = TRUE) %>%
+  print()
+```
+
+---
+
+# Step 6 — Data Quality Checks
+
+Review missingness and coverage before classifying students. Any remaining
+gaps in `CLASSIF_FINAL` or `RES_STATUS_FINAL` after all three fallback tiers
+should be investigated here.
+
+```{r quality-checks}
+# Overall missingness after all fallbacks
+cat("=== Overall missingness after all fallbacks ===\n")
+stud_combined %>%
+  summarise(
+    n_rows                  = n(),
+    missing_classif_final   = sum(is.na(CLASSIF_FINAL)),
+    missing_res_status_final = sum(is.na(RES_STATUS_FINAL)),
+    missing_both            = sum(is.na(CLASSIF_FINAL) & is.na(RES_STATUS_FINAL)),
+    missing_fa_load         = sum(is.na(CTERM_FA_LOAD_CODE)),
+    missing_subject         = sum(is.na(CLASS_SUBJECT_LDESC))
+  ) %>%
+  print()
+
+# Missingness by term — helps identify if gaps are concentrated in specific terms
+cat("\n=== Missing CLASSIF_FINAL and RES_STATUS_FINAL by term ===\n")
+stud_combined %>%
+  group_by(CLASS_TERM_CD) %>%
+  summarise(
+    n_rows                   = n(),
+    missing_classif_final    = sum(is.na(CLASSIF_FINAL)),
+    missing_res_status_final = sum(is.na(RES_STATUS_FINAL))
+  ) %>%
+  arrange(CLASS_TERM_CD) %>%
+  print()
+
+# Duplicate check: should be one row per student x term x class
+# If n > 1 for any combo, investigate upstream join
+cat("\n=== Duplicate enrollment rows check ===\n")
+stud_combined %>%
+  count(ENRL_EMPLID, CLASS_TERM_CD, CLASS_SID) %>%
+  filter(n > 1) %>%
+  nrow() %>%
+  cat("Duplicate student × term × class rows:", ., "\n")
+```
+
+---
+
+# Step 7 — Classify Students into Career Groups
+
+## 7a — Career Groups
+
+Classification priority (applied in order):
+
+1. **WI 65+ Audit** — `CLASSIF_FINAL %in% c('S', 'T')` AND `RES_STATUS_FINAL == 'R'` AND `CTERM_FA_LOAD_CODE == 'N'`
+2. **UFLX** — `ENRL_ACAD_CAREER == 'UFLX'` OR term code does not start with `'1'`
+3. **GRAD** — `ENRL_ACAD_CAREER == 'GRAD'`
+4. **UGRD** — `ENRL_ACAD_CAREER == 'UGRD'`
+5. **Other** — review and reclassify as needed
+
+```{r classify-career}
+stud_classified <- stud_combined %>%
+  mutate(
+    is_senior_65  = CLASSIF_FINAL %in% c('S', 'T'),
+    is_wi_res_cdr = RES_STATUS_FINAL == 'R',
+    is_no_load    = CTERM_FA_LOAD_CODE == 'N',
+    # Identify UFlex by BOTH career code AND term-code prefix (5/6)
+    is_uflex      = ENRL_ACAD_CAREER == 'UFLX' |
+                    !str_starts(as.character(CLASS_TERM_CD), "1"),
+
+    CAREER_GROUP = case_when(
+      is_senior_65 & is_wi_res_cdr & is_no_load ~ 'WI 65+ Audit',
+      is_uflex                                  ~ 'UFLX',
+      ENRL_ACAD_CAREER == 'GRAD'                ~ 'GRAD',
+      ENRL_ACAD_CAREER == 'UGRD'                ~ 'UGRD',
+      TRUE                                      ~ 'Other'
+    )
+  )
+
+cat("Career group distribution:\n")
+stud_classified %>%
+  count(CAREER_GROUP, ENRL_ACAD_CAREER, sort = TRUE) %>%
+  print()
+
+# Investigate any 'Other' rows — these should be reviewed and reclassified
+cat("\n'Other' career group breakdown:\n")
+stud_classified %>%
+  filter(CAREER_GROUP == 'Other') %>%
+  count(ENRL_ACAD_CAREER, CLASS_TERM_CD, sort = TRUE) %>%
+  print()
+```
+
+## 7b — Graduate Students: Keep Graduate-Level Courses Only
+
+Grad students sometimes take undergraduate courses. Only credit hours from
+graduate-level classes count toward the GRAD billing bucket.
+
+```{r grad-filter}
+# Review academic group labels for GRAD students before filtering
+cat("Academic group labels for GRAD students:\n")
+stud_classified %>%
+  filter(CAREER_GROUP == 'GRAD') %>%
+  count(CLASS_ACAD_GROUP_LDESC, sort = TRUE) %>%
+  print()
+```
+
+```{r apply-grad-filter}
+# Confirm 'Graduate' is the correct label in your data and update if needed
+GRAD_COURSE_GROUPS <- c('Graduate')
+
+stud_for_billing <- stud_classified %>%
+  filter(
+    !(CAREER_GROUP == 'GRAD' & !CLASS_ACAD_GROUP_LDESC %in% GRAD_COURSE_GROUPS),
+    CAREER_GROUP != 'WI 65+ Audit'
+  )
+
+cat("Rows in billing dataset:", nrow(stud_for_billing), "\n")
+```
+
+## 7c — Assign Residency Category
+
+For **traditional students**, `RES_STATUS_FINAL` is the authoritative source.
+`RES_STATUS_FINAL = 'E'` (Midwest Exchange) is recoded to **Midwest Tuition Non-Resident**.
+
+For **UFlex students**, `RES_STATUS_FINAL` will typically be `NA` (not in CDR),
+so we fall back to the RDS `RES_TUITION_RES_LDESC` field.
+
+```{r assign-residency}
+stud_for_billing <- stud_for_billing %>%
+  mutate(
+    RESIDENCY_CATEGORY = case_when(
+
+      # ── Traditional students: use RES_STATUS_FINAL ────────────────────────
+      !is_uflex & RES_STATUS_FINAL == 'R' ~ 'Resident',
+      !is_uflex & RES_STATUS_FINAL == 'A' ~ 'Resident - Alumni Discount',
+      !is_uflex & RES_STATUS_FINAL == 'E' ~ 'Midwest Tuition Non-Resident',
+      !is_uflex & RES_STATUS_FINAL == 'L' ~ 'Midwest Tuition Non-Resident',
+      !is_uflex & RES_STATUS_FINAL == 'M' ~ 'Non-Resident - Michigan Reciprocity',
+      !is_uflex & RES_STATUS_FINAL == 'S' ~ 'Non-Resident - Minnesota Reciprocity',
+      !is_uflex & RES_STATUS_FINAL == 'W' ~ 'Non-Resident - Wisconsin Return Discount',
+      !is_uflex & RES_STATUS_FINAL == 'V' ~ 'Non-Resident - Veteran',
+      !is_uflex & RES_STATUS_FINAL == 'B' ~ 'Non-Resident - Alumni Discount',
+      !is_uflex & RES_STATUS_FINAL == 'N' ~ 'Non-Resident',
+      !is_uflex & !is.na(RES_STATUS_FINAL) ~
+        paste0('Non-Resident - Other (', RES_STATUS_FINAL, ')'),
+
+      # ── UFlex students: fall back to RDS residency description ─────────────
+      is_uflex ~ case_when(
+        str_detect(
+          RES_TUITION_RES_LDESC,
+          regex("midwest.*(exchange|compact)|exchange.*(midwest|compact)",
+                ignore_case = TRUE)
+        )                              ~ 'Midwest Tuition Non-Resident',
+        !is.na(RES_TUITION_RES_LDESC) ~ RES_TUITION_RES_LDESC,
+        TRUE                           ~ 'Unknown'
+      ),
+
+      TRUE ~ 'Unknown'
+    )
+  )
+
+cat("Residency category distribution:\n")
+stud_for_billing %>%
+  count(CAREER_GROUP, RESIDENCY_CATEGORY, sort = TRUE) %>%
+  print(n = 40)
+```
+
+## 7d — Investigate Unknown Residency
+
+Any row where `RESIDENCY_CATEGORY == 'Unknown'` signals a gap. The checks
+below identify whether the problem is concentrated in a specific career group,
+term, or raw residency value.
+
+```{r residency-unknown}
+unknown_res <- stud_for_billing %>%
+  filter(RESIDENCY_CATEGORY == 'Unknown')
+
+cat("Total 'Unknown' residency rows:", nrow(unknown_res), "\n\n")
+
+cat("--- By CAREER_GROUP ---\n")
+unknown_res %>%
+  count(CAREER_GROUP, sort = TRUE) %>%
+  print()
+
+cat("\n--- Traditional students: raw RES_STATUS_FINAL values ---\n")
+unknown_res %>%
+  filter(!is_uflex) %>%
+  count(RES_STATUS_FINAL, sort = TRUE) %>%
+  print()
+
+cat("\n--- UFlex students: raw RES_TUITION_RES_LDESC values ---\n")
+unknown_res %>%
+  filter(is_uflex) %>%
+  count(RES_TUITION_RES_LDESC, sort = TRUE) %>%
+  print()
+
+cat("\n--- By term ---\n")
+unknown_res %>%
+  count(CLASS_TERM_CD, CLASS_TERM_SDESC, CAREER_GROUP, sort = TRUE) %>%
+  print()
+
+cat("\n--- Sample rows (up to 20 distinct students) ---\n")
+unknown_res %>%
+  select(ENRL_EMPLID, CLASS_TERM_CD, CAREER_GROUP, CLASSIF_FINAL,
+         RES_STATUS_FINAL, RES_TUITION_RES_LDESC, RESIDENCY_CATEGORY) %>%
+  distinct() %>%
+  slice_head(n = 20) %>%
+  print()
+```
+
+## 7e — Investigate Missing CLASSIF_FINAL
+
+```{r classif-missing}
+missing_classif <- stud_for_billing %>%
+  filter(is.na(CLASSIF_FINAL))
+
+cat("Total rows with missing CLASSIF_FINAL:", nrow(missing_classif), "\n\n")
+
+cat("--- By CAREER_GROUP ---\n")
+missing_classif %>%
+  count(CAREER_GROUP, sort = TRUE) %>%
+  print()
+
+cat("\n--- By term ---\n")
+missing_classif %>%
+  count(CLASS_TERM_CD, CLASS_TERM_SDESC, sort = TRUE) %>%
+  print()
+```
+
+---
+
+# Step 8 — Credit Hours Summaries by Career Group
+
+Separate tables are produced for each billing bucket. Grain: one row per
+**student × term × subject**. A student taking two sections of the same
+subject in the same term has their credit hours summed.
+
+```{r credit-hours-ugrd}
+credit_hours_ugrd <- stud_for_billing %>%
+  filter(CAREER_GROUP == 'UGRD') %>%
+  group_by(
+    ENRL_EMPLID,
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
+    CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
+    CAREER_GROUP,
+    CLASSIF_FINAL,
+    RES_STATUS_FINAL,
+    RESIDENCY_CATEGORY,
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
+  ) %>%
+  summarise(
+    n_classes          = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID, CLASS_SUBJECT_LDESC)
+
+cat("Undergraduate — rows:", nrow(credit_hours_ugrd),
+    "| credit hrs taken:", sum(credit_hours_ugrd$credit_hrs_taken), "\n")
+credit_hours_ugrd
+```
+
+```{r credit-hours-grad}
+credit_hours_grad <- stud_for_billing %>%
+  filter(CAREER_GROUP == 'GRAD') %>%
+  group_by(
+    ENRL_EMPLID,
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
+    CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
+    CAREER_GROUP,
+    CLASSIF_FINAL,
+    RES_STATUS_FINAL,
+    RESIDENCY_CATEGORY,
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
+  ) %>%
+  summarise(
+    n_classes          = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID, CLASS_SUBJECT_LDESC)
+
+cat("Graduate — rows:", nrow(credit_hours_grad),
+    "| credit hrs taken:", sum(credit_hours_grad$credit_hrs_taken), "\n")
+credit_hours_grad
+```
+
+```{r credit-hours-uflx}
+credit_hours_uflx <- stud_for_billing %>%
+  filter(CAREER_GROUP == 'UFLX') %>%
+  group_by(
+    ENRL_EMPLID,
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_CD,
+    CLASS_TERM_SDESC,
+    ENRL_ACAD_CAREER,
+    CAREER_GROUP,
+    CLASSIF_FINAL,
+    RES_STATUS_FINAL,
+    RESIDENCY_CATEGORY,
+    CTERM_FA_LOAD_CODE,
+    CLASS_SUBJECT_LDESC,
+    CLASS_ACAD_GROUP_LDESC,
+    CLASS_ACAD_ORG_LDESC
+  ) %>%
+  summarise(
+    n_classes          = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,   na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, ENRL_EMPLID, CLASS_SUBJECT_LDESC)
+
+cat("UFlex — rows:", nrow(credit_hours_uflx),
+    "| credit hrs taken:", sum(credit_hours_uflx$credit_hrs_taken), "\n")
+credit_hours_uflx
+```
+
+---
+
+# Step 9 — WI 65+ Audit Summary (Separate, Not Billed)
+
+```{r wi65-summary}
+wi65_summary <- stud_classified %>%
+  filter(CAREER_GROUP == 'WI 65+ Audit') %>%
+  group_by(
+    CLASS_TERM_ACAD_YEAR,
+    CLASS_TERM_SDESC,
+    CLASS_SUBJECT_LDESC
+  ) %>%
+  summarise(
+    n_enrollments      = n(),
+    credit_hrs_taken   = sum(ENRL_UNITS_TAKEN,  na.rm = TRUE),
+    credit_hrs_billing = sum(ENRL_UNITS_BILLING, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(CLASS_TERM_ACAD_YEAR, CLASS_TERM_SDESC, CLASS_SUBJECT_LDESC)
+
+wi65_summary
+```

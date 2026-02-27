@@ -1,5 +1,6 @@
 ---
 title: "Credit Hours by Program — Streamlined"
+  subtitle: "Most up to date"
 author: "Tony Daza"
 date: "`r Sys.Date()`"
 output: html_document
@@ -102,10 +103,12 @@ cdr_term_map <- tribble(
   '1255',         '202425',   '2',   # Spring 2024-2025
   '1257',         '202425',   'S',   # Summer 2024-2025
   '1261',         '202526',   '1',   # Fall   2025-2026
-  '1263',         '202526',   'W',   # Winter 2025-2026 (verify if CDR has winter)
+  '1263',         '202526',   'W',   # Winter 2025-2026 
   '1265',         '202526',   '2',   # Spring 2025-2026
 )
 
+
+# CDR will not have Winter 2026 nor will it have Spring 2026
 ```
 
 ---
@@ -166,9 +169,10 @@ stud_enroll_full <- dbGetQuery(
         c.CLASS_TERM_CD,
         c.CLASS_TERM_SDESC,
         c.CLASS_TERM_ACAD_YEAR,
-        c.CLASS_ACAD_GROUP_LDESC,   -- e.g. 'Undergraduate', 'Graduate'
+        c.CLASS_ACAD_GROUP_LDESC,   -- e.g. college of arts, etc.
         c.CLASS_ACAD_ORG_LDESC,
-        c.CLASS_SUBJECT_LDESC
+        c.CLASS_SUBJECT_LDESC,
+        c.CLASS_CATALOG_NBR
       FROM PKS_RDS_USR.REC_ENROLLMENT_FACT_V e
       JOIN PKS_RDS_USR.REC_CLASS_DIM_V c
         ON c.CLASS_SID = e.CLASS_SID
@@ -237,6 +241,76 @@ stud_enroll_full <- dbGetQuery(
   )
 )
 
+
+
+###############################
+
+# ── Ungrouped distributions (row-level) ──────────────────────────────────────
+cat("=== ENRL_ACAD_CAREER (row-level) ===\n")
+stud_enroll_full %>% count(ENRL_ACAD_CAREER, sort = TRUE) %>% print()
+# UGRD 52283
+# GRAD  7264
+# UFLX  2061
+
+cat("\n=== CTERM_ACAD_LEVEL_BOT_LDESC (row-level) ===\n")
+stud_enroll_full %>% count(CTERM_ACAD_LEVEL_BOT_LDESC, sort = TRUE) %>% print()
+# Senior 15426
+# Junior 12762
+# Freshman 12726
+# Sophomore 11135
+# Graduate  7264
+# UG Special  2295
+
+cat("\n=== RES_RESIDENCY (row-level) ===\n")
+stud_enroll_full %>% count(RES_RESIDENCY, sort = TRUE) %>% print()
+# RESIDENCY n
+# R 50061
+# N  8314
+# D  3124
+# S    87
+# E    15
+# NA   7
+
+
+# ── Student-level distributions (distinct EMPLID per value) ──────────────────
+cat("\n=== ENRL_ACAD_CAREER (distinct students) ===\n")
+stud_enroll_full %>%
+  distinct(ENRL_EMPLID, ENRL_ACAD_CAREER) %>%
+  count(ENRL_ACAD_CAREER, sort = TRUE) %>%
+  print()
+
+# Student level
+# UGRD 5544
+# GRAD 1061
+# UFLX  240
+
+cat("\n=== CTERM_ACAD_LEVEL_BOT_LDESC (distinct students) ===\n")
+stud_enroll_full %>%
+  distinct(ENRL_EMPLID, CTERM_ACAD_LEVEL_BOT_LDESC) %>%
+  count(CTERM_ACAD_LEVEL_BOT_LDESC, sort = TRUE) %>%
+  print()
+# Student Level
+# Senior 1742
+# Junior 1492
+# Freshman 1469
+# UG Special 1412
+# Sophomore 1305
+# Graduate 1061
+
+cat("\n=== RES_RESIDENCY (distinct students) ===\n")
+stud_enroll_full %>%
+  distinct(ENRL_EMPLID, RES_RESIDENCY) %>%
+  count(RES_RESIDENCY, sort = TRUE) %>%
+  print()
+# Student level
+# RESIDENCY    n
+# R 5650
+# N  843
+# D  326
+# S    6
+# NA   5
+# E    2
+
 ```
 
 ---
@@ -265,61 +339,15 @@ trad_emplids <- stud_enroll_full %>%
   mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
   pull(ENRL_EMPLID)
 
-trad_emplids_sql <- paste(sprintf("'%s'", trad_emplids), collapse = ", ")
-
-# Build (YEAR, TERM) pairs from the mapping table for the WHERE clause
-cdr_year_term_pairs <- cdr_term_map %>%
-  mutate(pair = sprintf("(YEAR = '%s' AND TERM = '%s')", CDR_YEAR, CDR_TERM)) %>%
-  pull(pair) %>%
-  paste(collapse = " OR ")
-
 emplid_chunks <- split(trad_emplids, ceiling(seq_along(trad_emplids) / 1000))
 
-stud_cdr <- purrr::map_dfr(emplid_chunks, function(chunk) {
-  chunk_sql <- paste(sprintf("'%s'", chunk), collapse = ", ")
-  
-  dbGetQuery(
-    con_cdr,
-    sprintf(
-      "
-      SELECT
-        sc.CAMPUS_STUDENT_ID,
-        sc.YEAR,
-        sc.TERM,
-        sc.CLASSIF,
-        sc.RES_STATUS
-      FROM UWSA.V_STUCRS sc
-      WHERE sc.UNIT = 'G'
-        AND sc.CAMPUS_STUDENT_ID IN (%s)
-        AND (%s)
-      ",
-      chunk_sql,
-      cdr_year_term_pairs
-    )
-  )
-})
+# ── Single CDR pull: recent history for all traditional students ─────────────
+# Pulls all terms from 2019-20 onward — enough history for fill-forward
+# without fetching the entire institutional record history.
+# Replaces the previous two separate chunked loops.
 
-# Join CDR term identifiers back to RDS CLASS_TERM_CD for merging
-stud_cdr <- stud_cdr %>%
-  mutate(YEAR = as.character(YEAR), TERM = as.character(TERM)) %>%
-  left_join(
-    cdr_term_map %>% mutate(YEAR = CDR_YEAR, TERM = CDR_TERM),
-    by = c("YEAR", "TERM")
-  ) %>%
-  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS) %>%
-  # V_STUCRS is course-grain; deduplicate to one row per student x term
-  # so the subsequent left join does not create row-multiplying duplicates
-  distinct()
+t_start <- Sys.time()
 
-# Spot-check CDR values for in-scope terms (pre fill-forward baseline)
-cat("CLASSIF distribution (in-scope terms, before fill-forward):\n")
-stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
-cat("\nRES_STATUS distribution (in-scope terms, before fill-forward):\n")
-stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
-
-# ── Secondary pull: all CDR records for these students (fill-forward) ────────
-# Fetches ALL years/terms so we can backfill CLASSIF and RES_STATUS when a
-# student has no record — or a NA value — for a specific in-scope term.
 stud_cdr_history <- purrr::map_dfr(emplid_chunks, function(chunk) {
   chunk_sql <- paste(sprintf("'%s'", chunk), collapse = ", ")
 
@@ -336,6 +364,7 @@ stud_cdr_history <- purrr::map_dfr(emplid_chunks, function(chunk) {
       FROM UWSA.V_STUCRS sc
       WHERE sc.UNIT = 'G'
         AND sc.CAMPUS_STUDENT_ID IN (%s)
+        AND sc.YEAR >= '201516'
       ",
       chunk_sql
     )
@@ -343,7 +372,26 @@ stud_cdr_history <- purrr::map_dfr(emplid_chunks, function(chunk) {
 }) %>%
   mutate(YEAR = as.character(YEAR), TERM = as.character(TERM))
 
+cat("CDR pull completed in", round(difftime(Sys.time(), t_start, units = "mins"), 1), "minutes\n")
+cat("Rows returned:", nrow(stud_cdr_history), "\n")
 
+# ── Derive in-scope term records from history (no second DB call needed) ─────
+# Filter history down to just the (YEAR, TERM) pairs matching our target terms
+stud_cdr <- stud_cdr_history %>%
+  inner_join(
+    cdr_term_map %>% mutate(YEAR = CDR_YEAR, TERM = CDR_TERM),
+    by = c("YEAR", "TERM")
+  ) %>%
+  select(CAMPUS_STUDENT_ID, CLASS_TERM_CD, CLASSIF, RES_STATUS) %>%
+  # V_STUCRS is course-grain; deduplicate to one row per student x term
+  # so the subsequent left join does not create row-multiplying duplicates
+  distinct()
+
+# Spot-check CDR values for in-scope terms (pre fill-forward baseline)
+cat("\nCLASSIF distribution (in-scope terms, before fill-forward):\n")
+stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
+cat("\nRES_STATUS distribution (in-scope terms, before fill-forward):\n")
+stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
 
 
 # CLASSIF distribution (in-scope terms, before fill-forward):
@@ -500,7 +548,55 @@ stud_cdr %>% count(CLASSIF, sort = TRUE) %>% print()
 cat("\nRES_STATUS distribution (after fill-forward):\n")
 stud_cdr %>% count(RES_STATUS, sort = TRUE) %>% print()
 
+#####################
 
+# CLASSIF distribution (in-scope terms, before fill-forward):
+#   CLASSIF  n
+#      D 1813
+#      E 1546
+#      A 1492
+#      C 1456
+#      B 1268
+#      N  959
+#      J   50
+#      O   46
+#      S   12
+#    <NA>    4
+#       K    2
+
+# CLASSIF distribution (after fill-forward):
+# CLASSIF n
+# D 1816
+# E 1547
+# A 1492
+# C 1456
+# B 1268
+# N  959
+# J   5
+# O   46
+# S   12
+# K    2
+
+
+####################
+
+# RES_STATUS distribution (in-scope terms, before fill-forward):
+#   RES_STATUS  n
+#          R 7203
+#          N 1133
+#          L  290
+#          S   11
+#          V    9
+#          E    2
+
+# Residency distribution (after fill-forward):
+# RES_STATUS    n
+# R 7203
+# N 1133
+# L  290
+# S   11
+# V    9
+# E    2
 
 ```
 
@@ -581,7 +677,7 @@ stud_enroll_full %>%
 
 ```
 
-## Fixing RES_STATUS from RDS data
+## Examining RES_STATUS from RDS data
 
 ```{r}
 
@@ -685,13 +781,7 @@ stud_enroll_full %>%
 ```{r join-rds-cdr}
 
 stud_combined <- stud_enroll_full %>%
-  # Oracle returns EMPLID as numeric; CDR returns CAMPUS_STUDENT_ID as character.
-  # Coerce before joining to avoid a type-mismatch silent non-match.
-  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID)) %>%
-  left_join(
-    stud_cdr,
-    by = c("ENRL_EMPLID" = "CAMPUS_STUDENT_ID", "CLASS_TERM_CD")
-  )
+  mutate(ENRL_EMPLID = as.character(ENRL_EMPLID))
 
 # CDR fields will be NA for UFlex students (expected — they are not in CDR)
 stud_combined %>%
@@ -699,19 +789,21 @@ stud_combined %>%
   group_by(is_uflex) %>%
   summarise(
     n_rows          = n(),
-    missing_classif = sum(is.na(CLASSIF)),
-    missing_res_status = sum(is.na(RES_STATUS))
+    missing_classif = sum(is.na(CLASSIF_FINAL)),
+    missing_res_status = sum(is.na(RES_STATUS_FINAL))
   )
 
 stud_combined %>% count(ENRL_ACAD_CAREER, sort = TRUE)
 
-stud_combined %>% summarise(n = n_distinct())
+stud_combined %>% summarise(n = n_distinct(ENRL_EMPLID))
+# 6799 unique students
 
 ```
+
 According to the output:
-GRAD		4951		
-UFLX		2038		
-UGRD		36391	
+GRAD		7264		
+UFLX		2061		
+UGRD		52283	
 
 
 ---
@@ -732,8 +824,8 @@ Classification priority (applied in order):
 ```{r classify-career}
 stud_classified <- stud_combined %>%
   mutate(
-    is_senior_65  = CLASSIF %in% c('S', 'T'),
-    is_wi_res_cdr = RES_STATUS == 'R',
+    is_senior_65  = CLASSIF_FINAL %in% c('S', 'T'),
+    is_wi_res_cdr = RES_STATUS_FINAL == 'R',
     is_no_load    = CTERM_FA_LOAD_CODE == 'N',
     # Identify UFlex by BOTH career code ('UFLX') AND term-code prefix (5/6),
     # so UFlex students enrolled under an unexpected career code are still caught.
@@ -753,6 +845,11 @@ stud_classified %>%
   count(CAREER_GROUP, ENRL_ACAD_CAREER, sort = TRUE)
 ```
 
+UGRD	UGRD	52270		
+GRAD	GRAD	7264		
+UFLX	UFLX	2061		
+WI65+	UGRD	13	
+
 ## 4b — Graduate Students: Keep Graduate-Level Courses Only
 
 Grad students sometimes take undergraduate courses. Only credit hours from
@@ -767,14 +864,15 @@ stud_classified %>%
 
 
 ```{r apply-grad-filter}
-# Confirm 'Graduate' is the correct label in your data and update if needed
-GRAD_COURSE_GROUPS <- c('Graduate')
+
 
 stud_for_billing <- stud_classified %>%
-  filter(
-    !(CAREER_GROUP == 'GRAD' & !CLASS_ACAD_GROUP_LDESC %in% GRAD_COURSE_GROUPS),
-    CAREER_GROUP != 'WI 65+ Audit'
-  )
+  mutate(
+    IS_GRAD_UGRD_COURSE = CAREER_GROUP == 'GRAD' & 
+                          !is.na(CLASS_CATALOG_NBR) & 
+                          as.numeric(CLASS_CATALOG_NBR) < 500
+  ) %>%
+  filter(CAREER_GROUP != 'WI 65+ Audit')
 
 ```
 
@@ -795,17 +893,17 @@ stud_for_billing <- stud_for_billing %>%
     RESIDENCY_CATEGORY = case_when(
 
       # ── Traditional students: use CDR RES_STATUS ───────────────────────────
-      !is_uflex & RES_STATUS == 'R' ~ 'Resident',
-      !is_uflex & RES_STATUS == 'A' ~ 'Resident - Alumni Discount',
-      !is_uflex & RES_STATUS == 'E' ~ 'Midwest Tuition Non-Resident',   # recoded from Exchange
-      !is_uflex & RES_STATUS == 'L' ~ 'Midwest Tuition Non-Resident',
-      !is_uflex & RES_STATUS == 'M' ~ 'Non-Resident - Michigan Reciprocity',
-      !is_uflex & RES_STATUS == 'S' ~ 'Non-Resident - Minnesota Reciprocity',
-      !is_uflex & RES_STATUS == 'W' ~ 'Non-Resident - Wisconsin Return Discount',
-      !is_uflex & RES_STATUS == 'V' ~ 'Non-Resident - Veteran',
-      !is_uflex & RES_STATUS == 'B' ~ 'Non-Resident - Alumni Discount',
-      !is_uflex & RES_STATUS == 'N' ~ 'Non-Resident',
-      !is_uflex & !is.na(RES_STATUS) ~ paste0('Non-Resident - Other (', RES_STATUS, ')'),
+      !is_uflex & RES_STATUS_FINAL == 'R' ~ 'Resident',
+      !is_uflex & RES_STATUS_FINAL == 'A' ~ 'Resident - Alumni Discount',
+      !is_uflex & RES_STATUS_FINAL == 'E' ~ 'Midwest Tuition Non-Resident',   # recoded from Exchange
+      !is_uflex & RES_STATUS_FINAL == 'L' ~ 'Midwest Tuition Non-Resident',
+      !is_uflex & RES_STATUS_FINAL == 'M' ~ 'Non-Resident - Michigan Reciprocity',
+      !is_uflex & RES_STATUS_FINAL == 'S' ~ 'Non-Resident - Minnesota Reciprocity',
+      !is_uflex & RES_STATUS_FINAL == 'W' ~ 'Non-Resident - Wisconsin Return Discount',
+      !is_uflex & RES_STATUS_FINAL == 'V' ~ 'Non-Resident - Veteran',
+      !is_uflex & RES_STATUS_FINAL == 'B' ~ 'Non-Resident - Alumni Discount',
+      !is_uflex & RES_STATUS_FINAL == 'N' ~ 'Non-Resident',
+      !is_uflex & !is.na(RES_STATUS_FINAL) ~ paste0('Non-Resident - Other (', RES_STATUS_FINAL, ')'),
 
       # ── UFlex students: fall back to RDS residency description ─────────────
       is_uflex ~ case_when(
@@ -831,6 +929,19 @@ stud_for_billing %>%
   print(n = 40)
 
 ```
+UNDERGRAD
+Resident                             43159
+Non-Resident                          6170
+Midwest Tuition Non-Resident          2807
+Non-Resident - Minnesota Reciprocity    87
+Non-Resident - Veteran                  43
+Unknown                                  4
+
+UFLEX
+Wisconsin Resident                    1344
+Non-Resident                           662
+Midwest Tuition rate                    55
+
 
 ## 4d — Investigate Unknown Residency
 
@@ -841,6 +952,7 @@ below identify whether the problem is concentrated in a specific career group,
 term, or raw residency value so it can be resolved upstream or recoded.
 
 ```{r residency-unknown}
+
 unknown_res <- stud_for_billing %>%
   filter(RESIDENCY_CATEGORY == 'Unknown')
 
@@ -897,7 +1009,10 @@ Grain for all three: one row per **student × term × subject**.  A student
 taking two sections of the same subject in the same term has their credit
 hours summed into a single row.
 
+## UG
+
 ```{r credit-hours-ugrd}
+
 credit_hours_ugrd <- stud_for_billing %>%
   filter(CAREER_GROUP == 'UGRD') %>%
   group_by(
@@ -907,8 +1022,8 @@ credit_hours_ugrd <- stud_for_billing %>%
     CLASS_TERM_SDESC,
     ENRL_ACAD_CAREER,
     CAREER_GROUP,
-    CLASSIF,
-    RES_STATUS,
+    CLASSIF_FINAL,
+    RES_STATUS_FINAL,
     RESIDENCY_CATEGORY,
     CTERM_FA_LOAD_CODE,
     CLASS_SUBJECT_LDESC,
@@ -927,9 +1042,14 @@ credit_hours_ugrd <- stud_for_billing %>%
 cat("Undergraduate — rows:", nrow(credit_hours_ugrd),
     "| credit hrs taken:", sum(credit_hours_ugrd$credit_hrs_taken), "\n")
 credit_hours_ugrd
+
+credit_hours_ugrd %>% names()
 ```
 
+## Grad
+
 ```{r credit-hours-grad}
+
 credit_hours_grad <- stud_for_billing %>%
   filter(CAREER_GROUP == 'GRAD') %>%
   group_by(
@@ -939,8 +1059,8 @@ credit_hours_grad <- stud_for_billing %>%
     CLASS_TERM_SDESC,
     ENRL_ACAD_CAREER,
     CAREER_GROUP,
-    CLASSIF,
-    RES_STATUS,
+    CLASSIF_FINAL,
+    RES_STATUS_FINAL,
     RESIDENCY_CATEGORY,
     CTERM_FA_LOAD_CODE,
     CLASS_SUBJECT_LDESC,
@@ -961,6 +1081,8 @@ cat("Graduate — rows:", nrow(credit_hours_grad),
 credit_hours_grad
 ```
 
+## UFLEX
+
 ```{r credit-hours-uflx}
 credit_hours_uflx <- stud_for_billing %>%
   filter(CAREER_GROUP == 'UFLX') %>%
@@ -971,8 +1093,8 @@ credit_hours_uflx <- stud_for_billing %>%
     CLASS_TERM_SDESC,
     ENRL_ACAD_CAREER,
     CAREER_GROUP,
-    CLASSIF,
-    RES_STATUS,
+    CLASSIF_FINAL,
+    RES_STATUS_FINAL,
     RESIDENCY_CATEGORY,
     CTERM_FA_LOAD_CODE,
     CLASS_SUBJECT_LDESC,
@@ -993,11 +1115,14 @@ cat("UFlex — rows:", nrow(credit_hours_uflx),
 credit_hours_uflx
 ```
 
+Eventually I will need to export these to excel and create groups by department with the different credit hours by student type and year for each department. It will require some pivots.
+
 ---
 
 # Step 6 — WI 65+ Audit Summary (Separate, Not Billed)
 
 ```{r wi65-summary}
+
 wi65_summary <- stud_classified %>%
   filter(CAREER_GROUP == 'WI 65+ Audit') %>%
   group_by(
@@ -1037,8 +1162,8 @@ stud_classified %>%
   group_by(CAREER_GROUP) %>%
   summarise(
     n              = n(),
-    missing_classif    = sum(is.na(CLASSIF)),
-    missing_res_status = sum(is.na(RES_STATUS))
+    missing_classif    = sum(is.na(CLASSIF_FINAL)),
+    missing_res_status = sum(is.na(RES_STATUS_FINAL))
   )
 
 # Career group counts
@@ -1053,4 +1178,286 @@ stud_classified %>%
 # Residency distribution in billing data
 stud_for_billing %>%
   count(CAREER_GROUP, RESIDENCY_CATEGORY, sort = TRUE)
+```
+
+# Step 7 Excel export 
+
+
+```{r excel export}
+
+library(openxlsx)
+
+# ── Chronological term order (defines sort for all sheets) ───────────────────
+TERM_ORDER <- c('1255', '1257', '1261', '1263', '1265',
+                '6506', '6507', '6508', '6509', '6510',
+                '6511', '6512', '6601', '6602', '6603')
+
+# ── Summarise to dept × term × residency ─────────────────────────────────────
+make_dept_summary <- function(data) {
+  data %>%
+    group_by(CLASS_ACAD_ORG_LDESC, CLASS_TERM_CD, CLASS_TERM_SDESC, RESIDENCY_CATEGORY) %>%
+    summarise(credit_hrs_billing = sum(credit_hrs_billing, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(CLASS_TERM_CD = factor(CLASS_TERM_CD, levels = TERM_ORDER)) %>%
+    arrange(CLASS_ACAD_ORG_LDESC, CLASS_TERM_CD)
+}
+
+ugrd_summary <- make_dept_summary(credit_hours_ugrd)
+grad_summary <- make_dept_summary(credit_hours_grad)
+uflx_summary <- make_dept_summary(credit_hours_uflx)
+
+# ── Build wide data frame with chronologically ordered columns ────────────────
+make_wide <- function(summary_data) {
+  
+  # Ordered terms actually present in this career group's data
+  terms_present <- summary_data %>%
+    distinct(CLASS_TERM_CD, CLASS_TERM_SDESC) %>%
+    arrange(CLASS_TERM_CD)   # factor levels from TERM_ORDER handle sort
+  
+  # Residency categories per term, ordered by total credit hours descending
+  # so Resident appears before Non-Resident consistently
+  res_by_term <- summary_data %>%
+    group_by(CLASS_TERM_CD, RESIDENCY_CATEGORY) %>%
+    summarise(total = sum(credit_hrs_billing), .groups = "drop") %>%
+    arrange(CLASS_TERM_CD, desc(total))
+  
+  # Column order: term1_res1, term1_res2, term2_res1, ...
+  col_order <- res_by_term %>%
+    mutate(col_key = paste0(as.character(CLASS_TERM_CD), "___", RESIDENCY_CATEGORY)) %>%
+    pull(col_key)
+  
+  wide <- summary_data %>%
+    mutate(col_key = paste0(as.character(CLASS_TERM_CD), "___", RESIDENCY_CATEGORY)) %>%
+    select(CLASS_ACAD_ORG_LDESC, col_key, credit_hrs_billing) %>%
+    pivot_wider(
+      names_from  = col_key,
+      values_from = credit_hrs_billing,
+      values_fill = 0
+    ) %>%
+    rename(Department = CLASS_ACAD_ORG_LDESC) %>%
+    # Enforce chronological column order
+    select(Department, all_of(col_order)) %>%
+    arrange(Department) %>%
+    # Totals row
+    bind_rows(
+      summarise(., across(where(is.numeric), sum), Department = "TOTAL")
+    ) %>%
+    # Grand total column
+    mutate(`Grand Total` = rowSums(across(where(is.numeric)), na.rm = TRUE))
+  
+  list(wide = wide, terms_present = terms_present, res_by_term = res_by_term)
+}
+
+# ── Styles ────────────────────────────────────────────────────────────────────
+style_term_header <- createStyle(
+  fontName       = "Arial", fontSize = 10, fontColour = "white",
+  fgFill         = "#2F5496", halign = "center", textDecoration = "bold",
+  border         = "TopBottomLeftRight", borderColour = "white", wrapText = TRUE
+)
+style_res_header <- createStyle(
+  fontName       = "Arial", fontSize = 9, fontColour = "white",
+  fgFill         = "#4472C4", halign = "center", textDecoration = "bold",
+  border         = "TopBottomLeftRight", borderColour = "white", wrapText = TRUE
+)
+style_dept_header <- createStyle(
+  fontName = "Arial", fontSize = 10, fontColour = "white",
+  fgFill   = "#2F5496", halign = "left", textDecoration = "bold"
+)
+style_data <- createStyle(
+  fontName = "Arial", fontSize = 10, numFmt = "#,##0", halign = "right",
+  border = "TopBottomLeftRight", borderColour = "#BFBFBF"
+)
+style_dept_col <- createStyle(
+  fontName = "Arial", fontSize = 10,
+  border = "TopBottomLeftRight", borderColour = "#BFBFBF"
+)
+style_total_row <- createStyle(
+  fontName = "Arial", fontSize = 10, textDecoration = "bold",
+  fgFill = "#D9E1F2", numFmt = "#,##0",
+  border = "TopBottomLeftRight", borderColour = "#BFBFBF"
+)
+style_grand_total_col <- createStyle(
+  fontName = "Arial", fontSize = 10, textDecoration = "bold",
+  fgFill = "#EBF0FA", numFmt = "#,##0"
+)
+
+# ── Write sheet with two-row merged term headers ──────────────────────────────
+write_sheet <- function(wb, sheet_name, summary_data, tab_color) {
+  
+  result       <- make_wide(summary_data)
+  wide         <- result$wide
+  terms_present <- result$terms_present
+  res_by_term  <- result$res_by_term
+  
+  addWorksheet(wb, sheet_name, tabColour = tab_color)
+  
+  n_data_rows <- nrow(wide)
+  n_data_cols <- ncol(wide)
+  data_start  <- 3   # rows 1-2 are headers, data begins row 3
+  
+  # ── Row 1 & 2: Department header (merged vertically) ─────────────────────
+  writeData(wb, sheet_name, "Department", startRow = 1, startCol = 1)
+  mergeCells(wb, sheet_name, rows = 1:2, cols = 1)
+  addStyle(wb, sheet_name, style_dept_header, rows = 1:2, cols = 1, gridExpand = TRUE)
+  
+  # ── Row 1: Term name headers (merged horizontally across residency cols) ──
+  col_idx <- 2
+  for (i in seq_len(nrow(terms_present))) {
+    
+    term_cd   <- as.character(terms_present$CLASS_TERM_CD[i])
+    term_desc <- terms_present$CLASS_TERM_SDESC[i]
+    
+    res_cats <- res_by_term %>%
+      filter(as.character(CLASS_TERM_CD) == term_cd) %>%
+      arrange(desc(total)) %>%
+      pull(RESIDENCY_CATEGORY)
+    
+    n_res <- length(res_cats)
+    
+    # Term name in row 1, merged across its residency columns
+    writeData(wb, sheet_name, term_desc, startRow = 1, startCol = col_idx)
+    if (n_res > 1) {
+      mergeCells(wb, sheet_name, rows = 1, cols = col_idx:(col_idx + n_res - 1))
+    }
+    addStyle(wb, sheet_name, style_term_header,
+             rows = 1, cols = col_idx:(col_idx + n_res - 1), gridExpand = TRUE)
+    
+    # ── Row 2: Residency category sub-headers ───────────────────────────────
+    for (j in seq_along(res_cats)) {
+      writeData(wb, sheet_name, res_cats[j],
+                startRow = 2, startCol = col_idx + j - 1)
+      addStyle(wb, sheet_name, style_res_header,
+               rows = 2, cols = col_idx + j - 1)
+    }
+    
+    col_idx <- col_idx + n_res
+  }
+  
+  # Grand Total header (merged vertically like Department)
+  writeData(wb, sheet_name, "Grand Total", startRow = 1, startCol = col_idx)
+  mergeCells(wb, sheet_name, rows = 1:2, cols = col_idx)
+  addStyle(wb, sheet_name, style_term_header, rows = 1:2, cols = col_idx, gridExpand = TRUE)
+  
+  # ── Rows 3+: Data (no column names — we wrote them manually above) ────────
+  writeData(wb, sheet_name, wide, startRow = data_start, startCol = 1,
+            colNames = FALSE)
+  
+  # Data cells (numeric columns, excluding total row)
+  addStyle(wb, sheet_name, style_data,
+           rows = data_start:(data_start + n_data_rows - 2),
+           cols = 2:n_data_cols, gridExpand = TRUE)
+  
+  # Department name column (data rows)
+  addStyle(wb, sheet_name, style_dept_col,
+           rows = data_start:(data_start + n_data_rows - 1),
+           cols = 1, gridExpand = TRUE)
+  
+  # Total row (last row)
+  addStyle(wb, sheet_name, style_total_row,
+           rows = data_start + n_data_rows - 1,
+           cols = 1:n_data_cols, gridExpand = TRUE)
+  
+  # Grand Total column
+  addStyle(wb, sheet_name, style_grand_total_col,
+           rows = data_start:(data_start + n_data_rows - 1),
+           cols = n_data_cols, gridExpand = TRUE)
+  
+  # Row heights for wrapped headers
+  setRowHeights(wb, sheet_name, rows = 1, heights = 30)
+  setRowHeights(wb, sheet_name, rows = 2, heights = 45)
+  
+  # Column widths
+  setColWidths(wb, sheet_name, cols = 1,          widths = 35)
+  setColWidths(wb, sheet_name, cols = 2:n_data_cols, widths = 18)
+  
+  # Freeze: keep department col and both header rows visible
+  freezePane(wb, sheet_name, firstActiveRow = data_start, firstActiveCol = 2)
+}
+
+# ── Build workbook ────────────────────────────────────────────────────────────
+wb <- createWorkbook()
+write_sheet(wb, "UGRD", ugrd_summary, "#2F5496")
+write_sheet(wb, "GRAD", grad_summary, "#538135")
+write_sheet(wb, "UFLX", uflx_summary, "#7030A0")
+
+
+# # ── WI 65+ Audit tab ──────────────────────────────────────────────────────────
+# Already summarised by term × subject; no residency pivot needed.
+# Ensure chronological term order matches other tabs.
+
+wi65_formatted <- wi65_summary %>%
+  mutate(CLASS_TERM_CD_SORT = factor(
+    # Map term description back to a sortable factor using TERM_ORDER position
+    # by joining back to a lookup of term desc → term cd
+    CLASS_TERM_SDESC,
+    levels = stud_classified %>%
+      distinct(CLASS_TERM_CD, CLASS_TERM_SDESC) %>%
+      mutate(CLASS_TERM_CD = factor(CLASS_TERM_CD, levels = TERM_ORDER)) %>%
+      arrange(CLASS_TERM_CD) %>%
+      pull(CLASS_TERM_SDESC)
+  )) %>%
+  arrange(CLASS_TERM_CD_SORT, CLASS_SUBJECT_LDESC) %>%
+  select(
+    Term          = CLASS_TERM_SDESC,
+    Subject       = CLASS_SUBJECT_LDESC,
+    Enrollments   = n_enrollments,
+    `Credit Hrs Taken`   = credit_hrs_taken,
+    `Credit Hrs Billing` = credit_hrs_billing
+  )
+
+style_wi65_header <- createStyle(
+  fontName = "Arial", fontSize = 10, fontColour = "white",
+  fgFill   = "#843C0C", halign = "center", textDecoration = "bold",
+  border   = "TopBottomLeftRight", borderColour = "white", wrapText = TRUE
+)
+
+addWorksheet(wb, "WI 65+ Audit", tabColour = "#F4B183")
+
+writeData(wb, "WI 65+ Audit", wi65_formatted,
+          startRow = 1, startCol = 1,
+          headerStyle = style_wi65_header, borders = "all", borderStyle = "thin")
+
+n_wi65_rows <- nrow(wi65_formatted)
+
+# Data styles
+addStyle(wb, "WI 65+ Audit", style_dept_col,
+         rows = 2:(n_wi65_rows + 1), cols = 1:2, gridExpand = TRUE)
+addStyle(wb, "WI 65+ Audit", style_data,
+         rows = 2:(n_wi65_rows + 1), cols = 3:5, gridExpand = TRUE)
+
+# Totals row
+addWorksheet_totals <- bind_cols(
+  tibble(Term = "TOTAL", Subject = ""),
+  wi65_formatted %>%
+    summarise(across(where(is.numeric), sum))
+)
+writeData(wb, "WI 65+ Audit", addWorksheet_totals,
+          startRow  = n_wi65_rows + 2, startCol = 1, colNames = FALSE)
+addStyle(wb, "WI 65+ Audit", style_total_row,
+         rows = n_wi65_rows + 2, cols = 1:5, gridExpand = TRUE)
+
+# Column widths
+setColWidths(wb, "WI 65+ Audit", cols = 1, widths = 25)
+setColWidths(wb, "WI 65+ Audit", cols = 2, widths = 35)
+setColWidths(wb, "WI 65+ Audit", cols = 3:5, widths = 18)
+
+setRowHeights(wb, "WI 65+ Audit", rows = 1, heights = 30)
+freezePane(wb, "WI 65+ Audit", firstActiveRow = 2, firstActiveCol = 1)
+
+## Save data
+
+output_path <- paste0("Credit_Hours_by_Department_", format(Sys.Date(), "%Y%m%d"), ".xlsx")
+saveWorkbook(wb, output_path, overwrite = TRUE)
+cat("Saved:", output_path, "\n")
+
+```
+
+
+# Final Data Spot checks
+
+```{r}
+
+
+credit_hours_ugrd %>% group_by(CLASS_ACAD_ORG_LDESC, CLASS_TERM_CD, RES_STATUS_FINAL) %>% summarise(credit_hrs_taken_total = sum(credit_hrs_taken))
+
 ```
